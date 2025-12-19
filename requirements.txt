@@ -1,0 +1,19 @@
+# Qwen3-VL-8B RunPod Handler Dependencies
+
+# vLLM for fast inference (must be >= 0.11.0 for Qwen3-VL support)
+vllm>=0.11.0
+
+# RunPod serverless SDK
+runpod
+
+# Image processing
+pillow
+
+# Qwen VL utilities
+qwen-vl-utils==0.0.14
+
+# Transformers (for tokenizer)
+transformers>=4.45.0
+
+# Accelerate for model loading
+accelerate
