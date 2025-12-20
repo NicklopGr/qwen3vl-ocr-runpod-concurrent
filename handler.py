@@ -45,28 +45,30 @@ llm = LLM(
 print(f"[Qwen3-VL-8B] Model loaded in {time.time() - start_load:.2f}s")
 
 # Optimized prompt for bank statement extraction
-# Two-phase approach: identify column headers first, then extract data
-BANK_STATEMENT_PROMPT = """Extract data from this bank statement image. Let's do this step by step.
+# Uses neutral column names to prevent semantic guessing
+BANK_STATEMENT_PROMPT = """Extract data from this bank statement image EXACTLY as it appears. You are a scanner, not an interpreter.
 
 STEP 1 - IDENTIFY TABLE COLUMNS:
-First, read the column headers from left to right. Bank statements typically have:
+Read the column headers from left to right. The table has 5 columns:
 - Column 1: Date
 - Column 2: Description/Details
-- Column 3: Withdrawals/Debits (money OUT - decreases balance)
-- Column 4: Deposits/Credits (money IN - increases balance)
+- Column 3: First amount column (left amount column)
+- Column 4: Second amount column (right amount column)
 - Column 5: Balance
 
 Report what you see:
 COLUMNS: [list the actual column header names from the image, left to right]
 
 STEP 2 - EXTRACT TRANSACTIONS:
-For each row, place amounts in the correct column based on their POSITION in the table, NOT based on the description text.
+Copy each row EXACTLY as it appears. Do not interpret or analyze meanings.
 
 CRITICAL RULES:
-- An amount in Column 3 position = DEBIT (withdrawal)
-- An amount in Column 4 position = CREDIT (deposit)
-- Do NOT guess based on description - use ONLY column position
+- Copy amounts EXACTLY as they appear in their column position
+- Amount in Column 3 position → write in Col3 output field
+- Amount in Column 4 position → write in Col4 output field
+- DO NOT interpret what the amount means - just copy its position
 - If a cell is empty, leave it blank between pipes
+- You are copying positions, NOT analyzing transaction types
 
 Output format:
 Bank: [bank name]
@@ -74,16 +76,17 @@ Account: [account number]
 Period: [date range]
 
 ---TRANSACTIONS---
-Date | Description | Debit | Credit | Balance
-[transactions here]
+Date | Description | Col3 | Col4 | Balance
+[transactions here, exactly as they appear]
 ---END---
 
 Additional rules:
 - Separator is | (pipe)
-- Every transaction MUST have its date
-- Description must be single line
+- Every row MUST have its date - if same as previous row, still include it
+- Description must be single line (as it appears)
 - Include ALL visible transactions
-- Keep amount format (e.g., 1,580.00)
+- Keep amount format exactly (e.g., 1,580.00)
+- Extract as they appear - do not reorder or interpret
 """
 
 # Sampling parameters for deterministic output
