@@ -45,7 +45,28 @@ llm = LLM(
 print(f"[Qwen3-VL-8B] Model loaded in {time.time() - start_load:.2f}s")
 
 # Optimized prompt for bank statement extraction
-BANK_STATEMENT_PROMPT = """Extract all data from this bank statement image.
+# Two-phase approach: identify column headers first, then extract data
+BANK_STATEMENT_PROMPT = """Extract data from this bank statement image. Let's do this step by step.
+
+STEP 1 - IDENTIFY TABLE COLUMNS:
+First, read the column headers from left to right. Bank statements typically have:
+- Column 1: Date
+- Column 2: Description/Details
+- Column 3: Withdrawals/Debits (money OUT - decreases balance)
+- Column 4: Deposits/Credits (money IN - increases balance)
+- Column 5: Balance
+
+Report what you see:
+COLUMNS: [list the actual column header names from the image, left to right]
+
+STEP 2 - EXTRACT TRANSACTIONS:
+For each row, place amounts in the correct column based on their POSITION in the table, NOT based on the description text.
+
+CRITICAL RULES:
+- An amount in Column 3 position = DEBIT (withdrawal)
+- An amount in Column 4 position = CREDIT (deposit)
+- Do NOT guess based on description - use ONLY column position
+- If a cell is empty, leave it blank between pipes
 
 Output format:
 Bank: [bank name]
@@ -54,16 +75,15 @@ Period: [date range]
 
 ---TRANSACTIONS---
 Date | Description | Debit | Credit | Balance
-[one transaction per line]
+[transactions here]
 ---END---
 
-Rules:
-- Separator is | (pipe), NOT comma
-- Empty column = leave blank between pipes
-- Every transaction MUST have its date (even if repeated from previous row)
-- Description must be single line (no line breaks)
+Additional rules:
+- Separator is | (pipe)
+- Every transaction MUST have its date
+- Description must be single line
 - Include ALL visible transactions
-- For amounts, keep the original format (e.g., 1,580.00)
+- Keep amount format (e.g., 1,580.00)
 """
 
 # Sampling parameters for deterministic output
