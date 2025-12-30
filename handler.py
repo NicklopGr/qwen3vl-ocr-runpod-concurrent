@@ -45,30 +45,32 @@ llm = LLM(
 print(f"[Qwen3-VL-8B] Model loaded in {time.time() - start_load:.2f}s")
 
 # Optimized prompt for bank statement extraction
-# Uses position-based Chain-of-Thought to prevent semantic guessing
+# Uses neutral column names to prevent semantic guessing
 BANK_STATEMENT_PROMPT = """Extract data from this bank statement image EXACTLY as it appears. You are a scanner, not an interpreter.
 
-STEP 1 - COUNT COLUMNS BY POSITION:
-Look at the table. Count columns from left to right: 1, 2, 3, 4, 5
-- Position 1: Date column
-- Position 2: Description column
-- Position 3: First amount column (left amount)
-- Position 4: Second amount column (right amount)
-- Position 5: Balance column
+STEP 1 - IDENTIFY TABLE COLUMNS:
+Read the column headers from left to right. The table has 5 columns:
+- Column 1: Date
+- Column 2: Description/Details
+- Column 3: First amount column (left amount column)
+- Column 4: Second amount column (right amount column)
+- Column 5: Balance
 
-DO NOT read or interpret column header names. Just count positions.
+Report what you see:
+COLUMNS: [list the actual column header names from the image, left to right]
 
-STEP 2 - COUNT VISIBLE ROWS:
-Count how many transaction rows are visible (excluding headers).
-Report: "I see approximately [X] transaction rows"
+STEP 2 - EXTRACT TRANSACTIONS:
+Copy each row EXACTLY as it appears. Do not interpret or analyze meanings.
 
-STEP 3 - EXTRACT BY POSITION:
-For each row, extract values by their POSITION (1,2,3,4,5).
-- If position 3 has an amount → write in Col3
-- If position 4 has an amount → write in Col4
-- Copy exactly what you see. Do not interpret.
+CRITICAL RULES:
+- Copy amounts EXACTLY as they appear in their column position
+- Amount in Column 3 position → write in Col3 output field
+- Amount in Column 4 position → write in Col4 output field
+- DO NOT interpret what the amount means - just copy its position
+- If a cell is empty, leave it blank between pipes
+- You are copying positions, NOT analyzing transaction types
 
-STEP 4 - OUTPUT FORMAT:
+Output format:
 Bank: [bank name]
 Account: [account number]
 Period: [date range]
@@ -78,12 +80,13 @@ Date | Description | Col3 | Col4 | Balance
 [transactions here, exactly as they appear]
 ---END---
 
-RULES:
+Additional rules:
 - Separator is | (pipe)
-- Every row MUST have its date
+- Every row MUST have its date - if same as previous row, still include it
+- Description must be single line (as it appears)
+- Include ALL visible transactions
 - Keep amount format exactly (e.g., 1,580.00)
-- If a cell is empty, leave blank between pipes
-- Extract ALL visible transactions
+- Extract as they appear - do not reorder or interpret
 """
 
 # Sampling parameters for deterministic output
