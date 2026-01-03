@@ -13,9 +13,9 @@ RUN pip install --no-cache-dir \
     pillow \
     qwen-vl-utils==0.0.14
 
-# Pre-download model during build
+# Pre-download FP8 model during build (must match MODEL_NAME in handler.py)
 ENV HF_HOME=/root/.cache/huggingface
-RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-VL-8B-Instruct')"
+RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-VL-8B-Instruct-FP8')"
 
 # Copy handler
 COPY handler.py /app/handler.py

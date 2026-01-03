@@ -16,25 +16,10 @@ import io
 import time
 import tempfile
 import os
-import shutil
 from PIL import Image
 
-# Clear ALL caches to free disk space for new model
-CACHE_DIRS = [
-    "/root/.cache/huggingface",      # HuggingFace cache (models, tokenizers)
-    "/root/.cache/vllm",              # vLLM compiled model cache
-    "/root/.cache/torch",             # PyTorch cache
-    "/tmp/vllm",                      # vLLM temp files
-    "/tmp/huggingface",               # HuggingFace temp files
-]
-
-for cache_dir in CACHE_DIRS:
-    if os.path.exists(cache_dir):
-        print(f"[Qwen3-VL-8B] Clearing cache at {cache_dir}...")
-        shutil.rmtree(cache_dir, ignore_errors=True)
-        print(f"[Qwen3-VL-8B] Cleared {cache_dir}")
-
-print("[Qwen3-VL-8B] All caches cleared")
+# Note: Model is pre-downloaded during Docker build (see Dockerfile)
+# Do NOT clear HuggingFace cache here - it would delete the pre-downloaded model
 
 # vLLM imports
 from vllm import LLM, SamplingParams
