@@ -16,7 +16,15 @@ import io
 import time
 import tempfile
 import os
+import shutil
 from PIL import Image
+
+# Clear HuggingFace cache to free disk space for new model
+HF_CACHE_DIR = "/root/.cache/huggingface/hub"
+if os.path.exists(HF_CACHE_DIR):
+    print(f"[Qwen3-VL-8B] Clearing HuggingFace cache at {HF_CACHE_DIR}...")
+    shutil.rmtree(HF_CACHE_DIR, ignore_errors=True)
+    print("[Qwen3-VL-8B] Cache cleared successfully")
 
 # vLLM imports
 from vllm import LLM, SamplingParams
