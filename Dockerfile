@@ -1,5 +1,6 @@
-# Qwen3-VL-8B RunPod Serverless Container
-# Uses vLLM for fast inference
+# Qwen-VL RunPod Serverless Container with Network Storage
+# Model is loaded from network storage to reduce cold starts
+# First run downloads model to network storage; subsequent runs use cached model
 
 FROM runpod/pytorch:2.4.0-py3.11-cuda12.4.1-devel-ubuntu22.04
 
@@ -11,11 +12,10 @@ RUN pip install --no-cache-dir \
     vllm>=0.6.0 \
     runpod \
     pillow \
-    qwen-vl-utils==0.0.14
-
-# Pre-download FP8 model during build (must match MODEL_NAME in handler.py)
-ENV HF_HOME=/root/.cache/huggingface
-RUN python -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-VL-8B-Instruct-FP8')"
+    qwen-vl-utils==0.0.14 \
+    huggingface_hub \
+    transformers>=4.45.0 \
+    accelerate
 
 # Copy handler
 COPY handler.py /app/handler.py
@@ -23,7 +23,22 @@ COPY handler.py /app/handler.py
 # RunPod configuration
 ENV RUNPOD_DEBUG_LEVEL=INFO
 ENV PYTHONUNBUFFERED=1
-ENV RUNPOD_INIT_TIMEOUT=600
+
+# Extended timeout for first-time model download to network storage
+# First cold start may take 5-10 minutes to download 30B+ model
+# Subsequent cold starts will be fast (model already on network storage)
+ENV RUNPOD_INIT_TIMEOUT=900
+
+# Default model - can be overridden in RunPod endpoint settings
+# Options:
+#   QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ  (~17GB, 8-bit AWQ, MoE 30B/3B active)
+#   Qwen/Qwen2.5-VL-32B-Instruct-AWQ         (~17GB, 8-bit AWQ)
+#   Qwen/Qwen3-VL-8B-Instruct-FP8            (~8GB, FP8 quantized)
+ENV MODEL_NAME="QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ"
+
+# NOTE: Model is NOT pre-downloaded in this image
+# Model will be downloaded to /runpod-volume/models/ on first run
+# This keeps the Docker image small and allows easy model switching
 
 # Start handler
 CMD ["python", "-u", "/app/handler.py"]

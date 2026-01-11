@@ -1,10 +1,10 @@
 """
-Qwen3-VL-8B RunPod Serverless Handler
+Qwen3-VL RunPod Serverless Handler with Network Storage
 
-Uses vLLM for fast inference with Qwen3-VL-8B-Instruct model.
-Extracts bank statement data into pipe-separated markdown format.
+Uses vLLM for fast inference with network storage to reduce cold starts.
+Model is downloaded once to network storage and reused across cold starts.
 
-Model: Qwen/Qwen3-VL-8B-Instruct
+Model: QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ (30B params, 3B active, 8-bit AWQ)
 Framework: vLLM
 Input: {"image_base64": "..."}
 Output: {"markdown": "Bank: ...\n---TRANSACTIONS---\n..."}
@@ -16,36 +16,96 @@ import io
 import time
 import tempfile
 import os
+from pathlib import Path
 from PIL import Image
 
-# Note: Model is pre-downloaded during Docker build (see Dockerfile)
-# Do NOT clear HuggingFace cache here - it would delete the pre-downloaded model
+# ============================================
+# NETWORK STORAGE CONFIGURATION
+# ============================================
+NETWORK_VOLUME = "/runpod-volume"
+MODEL_NAME = os.environ.get("MODEL_NAME", "QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ")
+
+# Convert model name to safe directory name (replace / with --)
+MODEL_DIR_NAME = MODEL_NAME.replace("/", "--")
+MODEL_LOCAL_PATH = os.path.join(NETWORK_VOLUME, "models", MODEL_DIR_NAME)
+
+def download_model_to_network_storage():
+    """
+    Download model to network storage if not already present.
+    This runs once on first cold start, then all subsequent starts use cached model.
+    """
+    model_path = Path(MODEL_LOCAL_PATH)
+
+    # Check if network volume is mounted
+    if not os.path.exists(NETWORK_VOLUME):
+        print(f"[WARNING] Network volume not mounted at {NETWORK_VOLUME}")
+        print(f"[WARNING] Falling back to HuggingFace cache (slower cold starts)")
+        return MODEL_NAME  # Return HF model ID for download to default cache
+
+    # Check if model already exists on network storage
+    if model_path.exists() and any(model_path.iterdir()):
+        print(f"[Qwen-VL] Model found on network storage: {MODEL_LOCAL_PATH}")
+        return MODEL_LOCAL_PATH
+
+    # Model not found - download to network storage
+    print(f"[Qwen-VL] Model not found on network storage. Downloading {MODEL_NAME}...")
+    print(f"[Qwen-VL] This is a one-time download. Future cold starts will use cached model.")
+
+    from huggingface_hub import snapshot_download
+
+    # Create models directory
+    model_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Download model to network storage
+    download_start = time.time()
+    snapshot_download(
+        MODEL_NAME,
+        local_dir=MODEL_LOCAL_PATH,
+        local_dir_use_symlinks=False,  # Copy files, don't symlink
+    )
+    download_time = time.time() - download_start
+    print(f"[Qwen-VL] Model downloaded in {download_time:.1f}s to {MODEL_LOCAL_PATH}")
+
+    return MODEL_LOCAL_PATH
+
+# ============================================
+# MODEL LOADING
+# ============================================
+print(f"[Qwen-VL] Starting model loading process...")
+print(f"[Qwen-VL] Configured model: {MODEL_NAME}")
+print(f"[Qwen-VL] Network storage path: {MODEL_LOCAL_PATH}")
+
+# Get model path (either network storage or HF cache)
+model_path = download_model_to_network_storage()
 
 # vLLM imports
 from vllm import LLM, SamplingParams
 from transformers import AutoProcessor
 from qwen_vl_utils import process_vision_info
 
-print("[Qwen3-VL-8B] Loading model and processor...")
+print(f"[Qwen-VL] Loading model from: {model_path}")
 start_load = time.time()
 
-# Model configuration - FP8 quantized for better memory efficiency
-MODEL_NAME = "Qwen/Qwen3-VL-8B-Instruct-FP8"
-
 # Load processor for chat template
-processor = AutoProcessor.from_pretrained(MODEL_NAME, trust_remote_code=True)
+processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
 
 # Initialize vLLM with multimodal support
+# Adjust settings based on model size
 llm = LLM(
-    model=MODEL_NAME,
+    model=model_path,
     trust_remote_code=True,
     max_model_len=8192,
     gpu_memory_utilization=0.95,
-    dtype="bfloat16",
+    dtype="auto",  # Let vLLM choose based on quantization
     limit_mm_per_prompt={"image": 1},  # One image per prompt
+    quantization="awq" if "AWQ" in MODEL_NAME.upper() else None,
 )
 
-print(f"[Qwen3-VL-8B] Model loaded in {time.time() - start_load:.2f}s")
+print(f"[Qwen-VL] Model loaded in {time.time() - start_load:.2f}s")
+
+# ============================================
+# PROMPTS AND PARAMETERS
+# ============================================
 
 # Optimized prompt for bank statement extraction
 # Uses neutral column names to prevent semantic guessing
@@ -101,7 +161,7 @@ sampling_params = SamplingParams(
 
 def handler(job):
     """
-    Process a bank statement image with Qwen3-VL-8B.
+    Process a bank statement image with Qwen-VL.
     """
     start_time = time.time()
 
@@ -117,7 +177,7 @@ def handler(job):
         image_data = base64.b64decode(image_base64)
         image = Image.open(io.BytesIO(image_data)).convert("RGB")
 
-        print(f"[Qwen3-VL-8B] Processing image: {image.size[0]}x{image.size[1]}")
+        print(f"[Qwen-VL] Processing image: {image.size[0]}x{image.size[1]}")
 
         # Save image to temp file for vLLM multimodal processing
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_file:
@@ -175,13 +235,14 @@ def handler(job):
 
             processing_time = time.time() - start_time
 
-            print(f"[Qwen3-VL-8B] Completed in {processing_time:.2f}s, output: {len(markdown)} chars")
+            print(f"[Qwen-VL] Completed in {processing_time:.2f}s, output: {len(markdown)} chars")
 
             return {
                 "status": "success",
                 "markdown": markdown,
                 "processing_time": processing_time,
-                "pipeline": "qwen3-vl-8b"
+                "pipeline": f"qwen-vl ({MODEL_NAME})",
+                "model_location": "network_storage" if model_path == MODEL_LOCAL_PATH else "hf_cache"
             }
 
         finally:
@@ -191,7 +252,7 @@ def handler(job):
 
     except Exception as e:
         import traceback
-        print(f"[Qwen3-VL-8B] Error: {str(e)}")
+        print(f"[Qwen-VL] Error: {str(e)}")
         print(traceback.format_exc())
         return {
             "status": "error",
