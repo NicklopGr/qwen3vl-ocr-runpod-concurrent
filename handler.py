@@ -102,6 +102,7 @@ llm = LLM(
     gpu_memory_utilization=0.95,
     dtype="auto",
     tensor_parallel_size=TENSOR_PARALLEL_SIZE,  # Split model across GPUs
+    distributed_executor_backend="mp",  # Required for multi-GPU on RunPod serverless
     limit_mm_per_prompt={"image": 1},
     quantization="awq_marlin" if "AWQ" in MODEL_NAME.upper() else None,  # awq_marlin is faster than awq
 )
