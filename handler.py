@@ -103,7 +103,7 @@ llm = LLM(
     dtype="auto",
     tensor_parallel_size=TENSOR_PARALLEL_SIZE,  # Split model across GPUs
     limit_mm_per_prompt={"image": 1},
-    quantization="awq" if "AWQ" in MODEL_NAME.upper() else None,
+    quantization="awq_marlin" if "AWQ" in MODEL_NAME.upper() else None,  # awq_marlin is faster than awq
 )
 
 print(f"[Qwen-VL] Model loaded in {time.time() - start_load:.2f}s across {TENSOR_PARALLEL_SIZE} GPUs")
