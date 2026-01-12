@@ -8,8 +8,9 @@ Supports batch processing of multiple images using 2 GPUs with tensor parallelis
 Model: QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ (30B params, 3B active, 8-bit AWQ)
 Framework: vLLM with tensor_parallel_size=2
 Input:
-  Single: {"image_base64": "..."}
+  Single: {"image_base64": "..."} or {"image_url": "..."}
   Batch:  {"images": [{"image_base64": "...", "prompt": "..."}, ...]}
+          {"images": [{"image_url": "...", "prompt": "..."}, ...]}
 Output: {"markdown": "..."} or {"results": [...]}
 """
 
@@ -19,6 +20,7 @@ import io
 import time
 import tempfile
 import os
+import requests
 from pathlib import Path
 from PIL import Image
 
@@ -162,10 +164,27 @@ sampling_params = SamplingParams(
 )
 
 
-def process_single_image(image_base64, custom_prompt=None):
-    """Process a single image and return the result."""
-    # Decode image
-    image_data = base64.b64decode(image_base64)
+def download_image_from_url(url: str, timeout: int = 60) -> bytes:
+    """Download image from URL (supports SAS URLs from Azure Blob)."""
+    response = requests.get(url, timeout=timeout)
+    response.raise_for_status()
+    return response.content
+
+
+def process_single_image(image_base64=None, image_url=None, custom_prompt=None):
+    """Process a single image and return the result.
+
+    Supports both base64 and URL input modes.
+    """
+    # Get image data from either base64 or URL
+    if image_url:
+        print(f"[Qwen-VL] Downloading image from URL...")
+        image_data = download_image_from_url(image_url)
+    elif image_base64:
+        image_data = base64.b64decode(image_base64)
+    else:
+        raise ValueError("Either image_base64 or image_url must be provided")
+
     image = Image.open(io.BytesIO(image_data)).convert("RGB")
 
     # Save to temp file
@@ -212,10 +231,13 @@ def handler(job):
     """
     Process bank statement images with Qwen-VL.
 
-    Supports two input modes:
-    1. Single image: {"image_base64": "...", "prompt": "..."}
-    2. Batch images: {"images": [{"image_base64": "...", "prompt": "..."}, ...]}
+    Supports multiple input modes:
+    1. Single base64: {"image_base64": "...", "prompt": "..."}
+    2. Single URL: {"image_url": "...", "prompt": "..."}
+    3. Batch base64: {"images": [{"image_base64": "...", "prompt": "..."}, ...]}
+    4. Batch URL: {"images": [{"image_url": "...", "prompt": "..."}, ...]}
 
+    URL mode supports Azure Blob SAS URLs for secure, large-scale processing.
     Batch mode processes all images in parallel using vLLM batching.
     """
     start_time = time.time()
@@ -233,18 +255,28 @@ def handler(job):
             # ============================================
             print(f"[Qwen-VL] Batch mode: processing {len(images_batch)} images")
 
+            # Detect input mode (URL or base64)
+            first_img = images_batch[0] if images_batch else {}
+            input_mode = "url" if first_img.get("image_url") else "base64"
+            print(f"[Qwen-VL] Input mode: {input_mode}")
+
             llm_inputs = []
             image_sizes = []
 
             for i, img_data in enumerate(images_batch):
                 img_base64 = img_data.get("image_base64")
+                img_url = img_data.get("image_url")
                 img_prompt = img_data.get("prompt")
 
-                if not img_base64:
-                    print(f"[Qwen-VL] Skipping image {i}: missing image_base64")
+                if not img_base64 and not img_url:
+                    print(f"[Qwen-VL] Skipping image {i}: missing image_base64 or image_url")
                     continue
 
-                llm_input, temp_path, size = process_single_image(img_base64, img_prompt)
+                llm_input, temp_path, size = process_single_image(
+                    image_base64=img_base64,
+                    image_url=img_url,
+                    custom_prompt=img_prompt
+                )
                 llm_inputs.append(llm_input)
                 temp_files.append(temp_path)
                 image_sizes.append(size)
@@ -290,12 +322,20 @@ def handler(job):
             # SINGLE MODE: Process one image
             # ============================================
             image_base64 = job_input.get("image_base64")
+            image_url = job_input.get("image_url")
             custom_prompt = job_input.get("prompt")
 
-            if not image_base64:
-                return {"error": "Missing image_base64 in input"}
+            if not image_base64 and not image_url:
+                return {"error": "Missing image_base64 or image_url in input"}
 
-            llm_input, temp_path, size = process_single_image(image_base64, custom_prompt)
+            input_mode = "url" if image_url else "base64"
+            print(f"[Qwen-VL] Single mode, input: {input_mode}")
+
+            llm_input, temp_path, size = process_single_image(
+                image_base64=image_base64,
+                image_url=image_url,
+                custom_prompt=custom_prompt
+            )
             temp_files.append(temp_path)
 
             print(f"[Qwen-VL] Processing single image: {size[0]}x{size[1]}")
