@@ -3,10 +3,10 @@ Qwen3-VL RunPod Serverless Handler with Network Storage
 
 Uses vLLM for fast inference with network storage to reduce cold starts.
 Model is downloaded once to network storage and reused across cold starts.
-Supports batch processing of multiple images using 2 GPUs with tensor parallelism.
+Supports batch processing of multiple images using 1 GPU.
 
 Model: QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ (30B params, 3B active, 8-bit AWQ)
-Framework: vLLM with tensor_parallel_size=2
+Framework: vLLM with tensor_parallel_size=1, max_model_len=14336
 Input:
   Single: {"image_base64": "..."} or {"image_url": "..."}
   Batch:  {"images": [{"image_base64": "...", "prompt": "..."}, ...]}
@@ -29,7 +29,7 @@ from PIL import Image
 # ============================================
 NETWORK_VOLUME = "/runpod-volume"
 MODEL_NAME = os.environ.get("MODEL_NAME", "QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ")
-TENSOR_PARALLEL_SIZE = int(os.environ.get("TENSOR_PARALLEL_SIZE", "2"))  # Use 2 GPUs
+TENSOR_PARALLEL_SIZE = int(os.environ.get("TENSOR_PARALLEL_SIZE", "1"))  # Use 1 GPU (avoids shared memory sync issues)
 
 # Convert model name to safe directory name (replace / with --)
 MODEL_DIR_NAME = MODEL_NAME.replace("/", "--")
@@ -96,12 +96,12 @@ start_load = time.time()
 # Load processor for chat template
 processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
 
-# Initialize vLLM with multimodal support and tensor parallelism
-# With 48GB VRAM and AWQ quantization, we can use 32768 tokens for high-res images
+# Initialize vLLM with multimodal support
+# Using 1 GPU with 14K context to avoid shared memory sync timeouts
 llm = LLM(
     model=model_path,
     trust_remote_code=True,
-    max_model_len=32768,
+    max_model_len=14336,  # 14K tokens (reduced from 32K to prevent OOM/timeouts)
     gpu_memory_utilization=0.95,
     dtype="auto",
     tensor_parallel_size=TENSOR_PARALLEL_SIZE,  # Split model across GPUs
