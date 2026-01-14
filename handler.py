@@ -97,10 +97,11 @@ start_load = time.time()
 processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
 
 # Initialize vLLM with multimodal support and tensor parallelism
+# With 48GB VRAM and AWQ quantization, we can use 32768 tokens for high-res images
 llm = LLM(
     model=model_path,
     trust_remote_code=True,
-    max_model_len=8192,
+    max_model_len=32768,
     gpu_memory_utilization=0.95,
     dtype="auto",
     tensor_parallel_size=TENSOR_PARALLEL_SIZE,  # Split model across GPUs
@@ -142,7 +143,10 @@ CRITICAL RULES:
 Output format:
 Bank: [bank name]
 Account: [account number]
+Account_Owner: [name of account holder if visible, otherwise leave blank]
 Period: [date range]
+Opening_Balance: [opening/beginning balance if shown, otherwise leave blank]
+Closing_Balance: [closing/ending balance if shown, otherwise leave blank]
 
 ---TRANSACTIONS---
 Date | Description | Col3 | Col4 | Balance
@@ -156,6 +160,7 @@ Additional rules:
 - Include ALL visible transactions
 - Keep amount format exactly (e.g., 1,580.00)
 - Extract as they appear - do not reorder or interpret
+- Only include Opening_Balance and Closing_Balance if explicitly shown on the statement - DO NOT calculate them
 """
 
 sampling_params = SamplingParams(
