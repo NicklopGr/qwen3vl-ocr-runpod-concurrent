@@ -233,6 +233,10 @@ CRITICAL RULES:
 - Do NOT calculate or infer Opening/Closing Balance - only include if explicitly shown
 - If only ONE amount column exists: negative or (parentheses) amounts → Debit, positive → Credit
 - SKIP these non-transaction rows: "Balance Forward", "Opening Balance", "Closing Balance", "Monthly Average", summary lines
+- BALANCE COLUMN: Only include a balance if that SPECIFIC row has a balance printed next to it.
+  - Do NOT repeat the same balance across multiple rows
+  - Do NOT copy closing balance to transaction rows that don't show it
+  - If unsure, leave Balance BLANK
 """
 
 sampling_params = SamplingParams(
