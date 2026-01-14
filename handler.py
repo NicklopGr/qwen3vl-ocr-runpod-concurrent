@@ -188,9 +188,24 @@ Map them to semantic columns:
 - BALANCE_COL: [position 1-5] = "[header text]"
 
 STEP 2 - EXTRACT TRANSACTIONS:
-For each transaction row, copy values from their source columns to our structured output:
-- Value from the column you mapped as DEBIT_COL → goes to Debit in output
-- Value from the column you mapped as CREDIT_COL → goes to Credit in output
+A TRANSACTION is defined as a row that has an AMOUNT (either Debit or Credit).
+For each transaction:
+- Copy values from their source columns to our structured output
+- Value from DEBIT_COL → goes to Debit in output
+- Value from CREDIT_COL → goes to Credit in output
+
+IMPORTANT - MULTI-LINE DESCRIPTIONS:
+Some transactions have descriptions that span multiple lines on the statement.
+You MUST combine them into ONE row in the output:
+- If a transaction's description continues on the next line(s), merge all description text into a single Description field
+- The output must have ONE ROW PER TRANSACTION (one row per amount)
+- Lines without amounts are description continuations - combine them with the transaction they belong to
+
+Example: If the statement shows:
+  "15 Apr | PAYROLL DEPOSIT    |        | 5,000.00 |
+         | ACME CORP REF#123  |        |          |"
+Output as ONE row:
+  "15 Apr | PAYROLL DEPOSIT ACME CORP REF#123 | | 5,000.00 |"
 
 Output format:
 Bank: [bank name]
@@ -202,10 +217,12 @@ Closing_Balance: [if explicitly shown]
 
 ---TRANSACTIONS---
 Date | Description | Debit | Credit | Balance
-[transactions here - amounts placed in correct semantic column based on your header mapping]
+[ONE ROW PER TRANSACTION - combine multi-line descriptions]
 ---END---
 
 CRITICAL RULES:
+- ONE ROW PER TRANSACTION: Each output row must have an amount (Debit or Credit). Never output rows without amounts.
+- COMBINE DESCRIPTIONS: If description spans multiple lines, merge into single Description field
 - Determine Debit vs Credit ONLY from column headers, NOT from transaction descriptions
 - If column header says "Withdrawals" or "Debits" or "Cheques" → that's the Debit column
 - If column header says "Deposits" or "Credits" → that's the Credit column
@@ -215,6 +232,7 @@ CRITICAL RULES:
 - Include ALL visible transactions
 - Do NOT calculate or infer Opening/Closing Balance - only include if explicitly shown
 - If only ONE amount column exists: negative or (parentheses) amounts → Debit, positive → Credit
+- SKIP these non-transaction rows: "Balance Forward", "Opening Balance", "Closing Balance", "Monthly Average", summary lines
 """
 
 sampling_params = SamplingParams(
