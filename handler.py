@@ -116,7 +116,11 @@ print(f"[Qwen-VL] Model loaded in {time.time() - start_load:.2f}s across {TENSOR
 # PROMPTS AND PARAMETERS
 # ============================================
 
-BANK_STATEMENT_PROMPT = """Extract data from this bank statement image EXACTLY as it appears. You are a scanner, not an interpreter.
+# ============================================
+# PROMPT V1 - Legacy (backed up 2025-01-14)
+# Uses generic Col3/Col4 output, requires extractor pattern matching
+# ============================================
+BANK_STATEMENT_PROMPT_V1 = """Extract data from this bank statement image EXACTLY as it appears. You are a scanner, not an interpreter.
 
 STEP 1 - IDENTIFY TABLE COLUMNS:
 Read the column headers from left to right. The table has 5 columns:
@@ -161,6 +165,56 @@ Additional rules:
 - Keep amount format exactly (e.g., 1,580.00)
 - Extract as they appear - do not reorder or interpret
 - Only include Opening_Balance and Closing_Balance if explicitly shown on the statement - DO NOT calculate them
+"""
+
+# ============================================
+# PROMPT V2 - Header-based semantic output (2025-01-14)
+# Qwen maps headers to semantic columns, outputs Debit/Credit directly
+# ============================================
+BANK_STATEMENT_PROMPT = """Extract data from this bank statement image.
+
+STEP 1 - READ THE COLUMN HEADERS:
+Look at the table header row. Identify each column by reading its header text exactly.
+Bank statements typically have columns for: Date, Description, Debits/Withdrawals, Credits/Deposits, Balance.
+
+Report the headers you see:
+HEADERS: [Column1Header, Column2Header, Column3Header, Column4Header, Column5Header]
+
+Map them to semantic columns:
+- DATE_COL: [position 1-5] = "[header text]"
+- DESC_COL: [position 1-5] = "[header text]"
+- DEBIT_COL: [position 1-5] = "[header text]" (look for: withdrawals, debits, cheques, payments, money out)
+- CREDIT_COL: [position 1-5] = "[header text]" (look for: deposits, credits, receipts, money in)
+- BALANCE_COL: [position 1-5] = "[header text]"
+
+STEP 2 - EXTRACT TRANSACTIONS:
+For each transaction row, copy values from their source columns to our structured output:
+- Value from the column you mapped as DEBIT_COL → goes to Debit in output
+- Value from the column you mapped as CREDIT_COL → goes to Credit in output
+
+Output format:
+Bank: [bank name]
+Account: [account number]
+Account_Owner: [name if visible]
+Period: [date range]
+Opening_Balance: [if explicitly shown]
+Closing_Balance: [if explicitly shown]
+
+---TRANSACTIONS---
+Date | Description | Debit | Credit | Balance
+[transactions here - amounts placed in correct semantic column based on your header mapping]
+---END---
+
+CRITICAL RULES:
+- Determine Debit vs Credit ONLY from column headers, NOT from transaction descriptions
+- If column header says "Withdrawals" or "Debits" or "Cheques" → that's the Debit column
+- If column header says "Deposits" or "Credits" → that's the Credit column
+- Copy amounts exactly as they appear (keep formatting like 1,580.00)
+- If a cell is empty, leave it blank between pipes
+- Every row must have its date (if same as previous, still include it)
+- Include ALL visible transactions
+- Do NOT calculate or infer Opening/Closing Balance - only include if explicitly shown
+- If only ONE amount column exists: negative or (parentheses) amounts → Debit, positive → Credit
 """
 
 sampling_params = SamplingParams(
