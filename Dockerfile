@@ -29,6 +29,9 @@ ENV PYTHONUNBUFFERED=1
 # Subsequent cold starts will be fast (model already on network storage)
 ENV RUNPOD_INIT_TIMEOUT=900
 
+# Maximum concurrent jobs per worker (default 5 for 30B model on 48GB GPU)
+ENV MAX_CONCURRENCY=5
+
 # Default model - can be overridden in RunPod endpoint settings
 # Options:
 #   QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ  (~17GB, 8-bit AWQ, MoE 30B/3B active)

@@ -1,22 +1,21 @@
 """
-Qwen3-VL RunPod Serverless Handler with Network Storage
+Qwen3-VL RunPod Serverless Handler (Concurrent Version)
 
-Uses vLLM for fast inference with network storage to reduce cold starts.
-Model is downloaded once to network storage and reused across cold starts.
-Supports batch processing of multiple images using 1 GPU.
+Same model and I/O schema as qwen3vl-ocr-runpod but with in-handler concurrency.
+Multiple jobs can run simultaneously on the same GPU worker.
+
+Key differences from original:
+- async def handler() instead of sync
+- concurrency_modifier returns MAX_CONCURRENCY (default 5)
+- asyncio.Semaphore wraps each inference call to limit GPU pressure
+- Each image processed as separate inference (no multi-image combining per job)
 
 Model: QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ (30B params, 3B active, 8-bit AWQ)
 Framework: vLLM with tensor_parallel_size=1, max_model_len=14336
-Input:
-  Single: {"image_base64": "..."} or {"image_url": "..."} or {"image_path": "/runpod-volume/..."}
-  Multi-tile via URLs: {"image_urls": ["https://...", ...]}  - tiles from same page, processed together
-  Multi-tile via paths: {"image_paths": ["/runpod-volume/...", ...]}  - tiles from same page
-  Batch:  {"images": [{"image_base64": "...", "prompt": "..."}, ...]}
-          {"images": [{"image_url": "...", "prompt": "..."}, ...]}
-Output: {"markdown": "..."} or {"results": [...]}
 """
 
 import runpod
+import asyncio
 import base64
 import io
 import time
@@ -31,63 +30,59 @@ from PIL import Image
 # ============================================
 NETWORK_VOLUME = "/runpod-volume"
 MODEL_NAME = os.environ.get("MODEL_NAME", "QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ")
-TENSOR_PARALLEL_SIZE = int(os.environ.get("TENSOR_PARALLEL_SIZE", "1"))  # Use 1 GPU (avoids shared memory sync issues)
+TENSOR_PARALLEL_SIZE = int(os.environ.get("TENSOR_PARALLEL_SIZE", "1"))
+MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "5"))
 
-# Convert model name to safe directory name (replace / with --)
+# Convert model name to safe directory name
 MODEL_DIR_NAME = MODEL_NAME.replace("/", "--")
 MODEL_LOCAL_PATH = os.path.join(NETWORK_VOLUME, "models", MODEL_DIR_NAME)
 
+# Semaphore to limit concurrent inference calls on GPU
+_inference_semaphore: asyncio.Semaphore | None = None
+
+
 def download_model_to_network_storage():
-    """
-    Download model to network storage if not already present.
-    This runs once on first cold start, then all subsequent starts use cached model.
-    """
+    """Download model to network storage if not already present."""
     model_path = Path(MODEL_LOCAL_PATH)
 
-    # Check if network volume is mounted
     if not os.path.exists(NETWORK_VOLUME):
         print(f"[WARNING] Network volume not mounted at {NETWORK_VOLUME}")
         print(f"[WARNING] Falling back to HuggingFace cache (slower cold starts)")
-        return MODEL_NAME  # Return HF model ID for download to default cache
+        return MODEL_NAME
 
-    # Check if model already exists on network storage
     if model_path.exists() and any(model_path.iterdir()):
         print(f"[Qwen-VL] Model found on network storage: {MODEL_LOCAL_PATH}")
         return MODEL_LOCAL_PATH
 
-    # Model not found - download to network storage
     print(f"[Qwen-VL] Model not found on network storage. Downloading {MODEL_NAME}...")
     print(f"[Qwen-VL] This is a one-time download. Future cold starts will use cached model.")
 
     from huggingface_hub import snapshot_download
 
-    # Create models directory
     model_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Download model to network storage
     download_start = time.time()
     snapshot_download(
         MODEL_NAME,
         local_dir=MODEL_LOCAL_PATH,
-        local_dir_use_symlinks=False,  # Copy files, don't symlink
+        local_dir_use_symlinks=False,
     )
     download_time = time.time() - download_start
     print(f"[Qwen-VL] Model downloaded in {download_time:.1f}s to {MODEL_LOCAL_PATH}")
 
     return MODEL_LOCAL_PATH
 
+
 # ============================================
-# MODEL LOADING
+# MODEL LOADING (runs once at container startup)
 # ============================================
-print(f"[Qwen-VL] Starting model loading process...")
+print(f"[Qwen-VL] Starting model loading process (concurrent handler, max_concurrency={MAX_CONCURRENCY})...")
 print(f"[Qwen-VL] Configured model: {MODEL_NAME}")
 print(f"[Qwen-VL] Tensor parallel size: {TENSOR_PARALLEL_SIZE} GPUs")
 print(f"[Qwen-VL] Network storage path: {MODEL_LOCAL_PATH}")
 
-# Get model path (either network storage or HF cache)
 model_path = download_model_to_network_storage()
 
-# vLLM imports
 from vllm import LLM, SamplingParams
 from transformers import AutoProcessor
 from qwen_vl_utils import process_vision_info
@@ -95,21 +90,18 @@ from qwen_vl_utils import process_vision_info
 print(f"[Qwen-VL] Loading model from: {model_path}")
 start_load = time.time()
 
-# Load processor for chat template
 processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
 
-# Initialize vLLM with multimodal support
-# Using 1 GPU with 14K context to avoid shared memory sync timeouts
 llm = LLM(
     model=model_path,
     trust_remote_code=True,
-    max_model_len=14336,  # 14K tokens (reduced from 32K to prevent OOM/timeouts)
+    max_model_len=14336,
     gpu_memory_utilization=0.95,
     dtype="auto",
-    tensor_parallel_size=TENSOR_PARALLEL_SIZE,  # Split model across GPUs
-    distributed_executor_backend="mp",  # Required for multi-GPU on RunPod serverless
-    limit_mm_per_prompt={"image": 4},  # Allow up to 4 tiles per page
-    quantization="awq_marlin" if "AWQ" in MODEL_NAME.upper() else None,  # awq_marlin is faster than awq
+    tensor_parallel_size=TENSOR_PARALLEL_SIZE,
+    distributed_executor_backend="mp",
+    limit_mm_per_prompt={"image": 4},
+    quantization="awq_marlin" if "AWQ" in MODEL_NAME.upper() else None,
 )
 
 print(f"[Qwen-VL] Model loaded in {time.time() - start_load:.2f}s across {TENSOR_PARALLEL_SIZE} GPUs")
@@ -118,61 +110,6 @@ print(f"[Qwen-VL] Model loaded in {time.time() - start_load:.2f}s across {TENSOR
 # PROMPTS AND PARAMETERS
 # ============================================
 
-# ============================================
-# PROMPT V1 - Legacy (backed up 2025-01-14)
-# Uses generic Col3/Col4 output, requires extractor pattern matching
-# ============================================
-BANK_STATEMENT_PROMPT_V1 = """Extract data from this bank statement image EXACTLY as it appears. You are a scanner, not an interpreter.
-
-STEP 1 - IDENTIFY TABLE COLUMNS:
-Read the column headers from left to right. The table has 5 columns:
-- Column 1: Date
-- Column 2: Description/Details
-- Column 3: First amount column (left amount column)
-- Column 4: Second amount column (right amount column)
-- Column 5: Balance
-
-Report what you see:
-COLUMNS: [list the actual column header names from the image, left to right]
-
-STEP 2 - EXTRACT TRANSACTIONS:
-Copy each row EXACTLY as it appears. Do not interpret or analyze meanings.
-
-CRITICAL RULES:
-- Copy amounts EXACTLY as they appear in their column position
-- Amount in Column 3 position → write in Col3 output field
-- Amount in Column 4 position → write in Col4 output field
-- DO NOT interpret what the amount means - just copy its position
-- If a cell is empty, leave it blank between pipes
-- You are copying positions, NOT analyzing transaction types
-
-Output format:
-Bank: [bank name]
-Account: [account number]
-Account_Owner: [name of account holder if visible, otherwise leave blank]
-Period: [date range]
-Opening_Balance: [opening/beginning balance if shown, otherwise leave blank]
-Closing_Balance: [closing/ending balance if shown, otherwise leave blank]
-
----TRANSACTIONS---
-Date | Description | Col3 | Col4 | Balance
-[transactions here, exactly as they appear]
----END---
-
-Additional rules:
-- Separator is | (pipe)
-- Every row MUST have its date - if same as previous row, still include it
-- Description must be single line (as it appears)
-- Include ALL visible transactions
-- Keep amount format exactly (e.g., 1,580.00)
-- Extract as they appear - do not reorder or interpret
-- Only include Opening_Balance and Closing_Balance if explicitly shown on the statement - DO NOT calculate them
-"""
-
-# ============================================
-# PROMPT V2 - Header-based semantic output (2025-01-14)
-# Qwen maps headers to semantic columns, outputs Debit/Credit directly
-# ============================================
 BANK_STATEMENT_PROMPT = """Extract data from this bank statement image.
 
 STEP 1 - READ THE COLUMN HEADERS:
@@ -256,25 +193,19 @@ def download_image_from_url(url: str, timeout: int = 60) -> bytes:
 
 def validate_local_path(path: str) -> bool:
     """Validate that a local path is safe (within allowed directories)."""
-    # Allow paths within /runpod-volume and /tmp
     allowed_prefixes = ["/runpod-volume/", "/tmp/"]
     return any(path.startswith(prefix) for prefix in allowed_prefixes) and os.path.exists(path)
 
 
 def process_local_image(image_path: str, custom_prompt: str = None):
-    """Process a single image from local path (RunPod Network Volume).
-
-    Returns llm_input and image size (no temp file needed).
-    """
+    """Process a single image from local path. Returns llm_input and image size."""
     if not validate_local_path(image_path):
         raise ValueError(f"Invalid or non-existent local path: {image_path}")
 
     image = Image.open(image_path).convert("RGB")
     size = image.size
-
     prompt = custom_prompt if custom_prompt else BANK_STATEMENT_PROMPT
 
-    # Create message
     messages = [
         {
             "role": "user",
@@ -285,20 +216,9 @@ def process_local_image(image_path: str, custom_prompt: str = None):
         }
     ]
 
-    # Apply chat template
-    text = processor.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True
-    )
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    image_inputs, video_inputs, video_kwargs = process_vision_info(messages, return_video_kwargs=True)
 
-    # Process vision info
-    image_inputs, video_inputs, video_kwargs = process_vision_info(
-        messages,
-        return_video_kwargs=True
-    )
-
-    # Create vLLM input
     llm_input = {
         "prompt": text,
         "multi_modal_data": {"image": image_inputs}
@@ -308,33 +228,22 @@ def process_local_image(image_path: str, custom_prompt: str = None):
 
 
 def process_multiple_local_images(image_paths: list, custom_prompt: str = None):
-    """Process multiple images (tiles from same page) in a single inference.
-
-    All tiles are combined into one message so the model can:
-    - Align context across tiles (headers, account info)
-    - Avoid duplicating/omitting rows at tile boundaries
-    - Maintain consistency within a page
-
-    Returns llm_input and list of image sizes.
-    """
+    """Process multiple tiles from same page in a single inference."""
     if not image_paths:
         raise ValueError("No image paths provided")
 
-    # Validate all paths first
     for path in image_paths:
         if not validate_local_path(path):
             raise ValueError(f"Invalid or non-existent local path: {path}")
 
-    # Build content with all images
     content = []
     sizes = []
 
-    for i, path in enumerate(image_paths):
+    for path in image_paths:
         image = Image.open(path).convert("RGB")
         sizes.append(image.size)
         content.append({"type": "image", "image": path})
 
-    # Add instructions for multi-tile processing
     prompt = custom_prompt if custom_prompt else BANK_STATEMENT_PROMPT
     multi_tile_prompt = f"""These {len(image_paths)} images are TILES from the SAME PAGE of a bank statement.
 They overlap slightly at the edges. Extract transactions as if viewing ONE continuous page.
@@ -347,23 +256,11 @@ IMPORTANT:
 {prompt}"""
 
     content.append({"type": "text", "text": multi_tile_prompt})
-
     messages = [{"role": "user", "content": content}]
 
-    # Apply chat template
-    text = processor.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True
-    )
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    image_inputs, video_inputs, video_kwargs = process_vision_info(messages, return_video_kwargs=True)
 
-    # Process vision info for all images
-    image_inputs, video_inputs, video_kwargs = process_vision_info(
-        messages,
-        return_video_kwargs=True
-    )
-
-    # Create vLLM input
     llm_input = {
         "prompt": text,
         "multi_modal_data": {"image": image_inputs}
@@ -373,17 +270,10 @@ IMPORTANT:
 
 
 def process_multiple_url_images(image_urls: list, custom_prompt: str = None):
-    """Process multiple images (tiles from same page) from URLs in a single inference.
-
-    Downloads all images, combines into one message for unified processing.
-    Used for Azure Blob SAS URLs when tiles need to be processed together.
-
-    Returns llm_input, list of temp file paths, and list of image sizes.
-    """
+    """Process multiple tiles from URLs in a single inference."""
     if not image_urls:
         raise ValueError("No image URLs provided")
 
-    # Download all images and save to temp files
     content = []
     sizes = []
     temp_files = []
@@ -394,7 +284,6 @@ def process_multiple_url_images(image_urls: list, custom_prompt: str = None):
         image = Image.open(io.BytesIO(image_data)).convert("RGB")
         sizes.append(image.size)
 
-        # Save to temp file
         with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_file:
             image.save(tmp_file, format="PNG")
             temp_path = tmp_file.name
@@ -402,7 +291,6 @@ def process_multiple_url_images(image_urls: list, custom_prompt: str = None):
 
         content.append({"type": "image", "image": temp_path})
 
-    # Add instructions for multi-tile processing
     prompt = custom_prompt if custom_prompt else BANK_STATEMENT_PROMPT
     multi_tile_prompt = f"""These {len(image_urls)} images are TILES from the SAME PAGE of a bank statement.
 They overlap slightly at the edges. Extract transactions as if viewing ONE continuous page.
@@ -415,23 +303,11 @@ IMPORTANT:
 {prompt}"""
 
     content.append({"type": "text", "text": multi_tile_prompt})
-
     messages = [{"role": "user", "content": content}]
 
-    # Apply chat template
-    text = processor.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True
-    )
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    image_inputs, video_inputs, video_kwargs = process_vision_info(messages, return_video_kwargs=True)
 
-    # Process vision info for all images
-    image_inputs, video_inputs, video_kwargs = process_vision_info(
-        messages,
-        return_video_kwargs=True
-    )
-
-    # Create vLLM input
     llm_input = {
         "prompt": text,
         "multi_modal_data": {"image": image_inputs}
@@ -441,11 +317,7 @@ IMPORTANT:
 
 
 def process_single_image(image_base64=None, image_url=None, custom_prompt=None):
-    """Process a single image and return the result.
-
-    Supports both base64 and URL input modes.
-    """
-    # Get image data from either base64 or URL
+    """Process a single image from base64 or URL. Returns llm_input, temp_path, size."""
     if image_url:
         print(f"[Qwen-VL] Downloading image from URL...")
         image_data = download_image_from_url(image_url)
@@ -456,14 +328,12 @@ def process_single_image(image_base64=None, image_url=None, custom_prompt=None):
 
     image = Image.open(io.BytesIO(image_data)).convert("RGB")
 
-    # Save to temp file
     with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_file:
         image.save(tmp_file, format="PNG")
         temp_image_path = tmp_file.name
 
     prompt = custom_prompt if custom_prompt else BANK_STATEMENT_PROMPT
 
-    # Create message
     messages = [
         {
             "role": "user",
@@ -474,20 +344,9 @@ def process_single_image(image_base64=None, image_url=None, custom_prompt=None):
         }
     ]
 
-    # Apply chat template
-    text = processor.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True
-    )
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    image_inputs, video_inputs, video_kwargs = process_vision_info(messages, return_video_kwargs=True)
 
-    # Process vision info
-    image_inputs, video_inputs, video_kwargs = process_vision_info(
-        messages,
-        return_video_kwargs=True
-    )
-
-    # Create vLLM input
     llm_input = {
         "prompt": text,
         "multi_modal_data": {"image": image_inputs}
@@ -496,35 +355,40 @@ def process_single_image(image_base64=None, image_url=None, custom_prompt=None):
     return llm_input, temp_image_path, image.size
 
 
-def handler(job):
+def run_inference_sync(llm_inputs):
+    """Synchronous wrapper for vLLM inference (called from executor)."""
+    return llm.generate(llm_inputs, sampling_params=sampling_params)
+
+
+async def run_inference(llm_inputs):
+    """Run vLLM inference with semaphore to limit concurrent GPU pressure."""
+    global _inference_semaphore
+    if _inference_semaphore is None:
+        _inference_semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
+
+    async with _inference_semaphore:
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(None, run_inference_sync, llm_inputs)
+
+
+async def handler(job):
     """
-    Process bank statement images with Qwen-VL.
+    Process bank statement images with Qwen-VL (async, concurrent-capable).
 
-    Supports multiple input modes:
-    1. Single base64: {"image_base64": "...", "prompt": "..."}
-    2. Single URL: {"image_url": "...", "prompt": "..."}
-    3. Batch base64: {"images": [{"image_base64": "...", "prompt": "..."}, ...]}
-    4. Batch URL: {"images": [{"image_url": "...", "prompt": "..."}, ...]}
-
-    URL mode supports Azure Blob SAS URLs for secure, large-scale processing.
-    Batch mode processes all images in parallel using vLLM batching.
+    Same I/O schema as original handler. Multiple jobs run simultaneously
+    on the same worker, with GPU inference serialized by semaphore.
     """
     start_time = time.time()
     temp_files = []
 
     try:
         job_input = job.get("input", {})
-
-        # Check for batch mode
         images_batch = job_input.get("images")
 
         if images_batch and isinstance(images_batch, list):
-            # ============================================
-            # BATCH MODE: Process multiple images at once
-            # ============================================
-            print(f"[Qwen-VL] Batch mode: processing {len(images_batch)} images")
+            # BATCH MODE
+            print(f"[Qwen-VL] Batch mode: processing {len(images_batch)} images (concurrent handler)")
 
-            # Detect input mode (URL or base64)
             first_img = images_batch[0] if images_batch else {}
             input_mode = "url" if first_img.get("image_url") else "base64"
             print(f"[Qwen-VL] Input mode: {input_mode}")
@@ -554,11 +418,9 @@ def handler(job):
             if not llm_inputs:
                 return {"error": "No valid images in batch"}
 
-            # Generate all responses in parallel batch
             print(f"[Qwen-VL] Running batch inference on {len(llm_inputs)} images...")
-            outputs = llm.generate(llm_inputs, sampling_params=sampling_params)
+            outputs = await run_inference(llm_inputs)
 
-            # Collect results
             results = []
             for i, output in enumerate(outputs):
                 markdown = output.outputs[0].text
@@ -586,17 +448,15 @@ def handler(job):
                 "model_location": "network_storage" if model_path == MODEL_LOCAL_PATH else "hf_cache"
             }
 
-        # ============================================
-        # MULTI-TILE URL MODE: Process multiple tiles from same page (via URLs)
-        # ============================================
         elif job_input.get("image_urls"):
+            # MULTI-TILE URL MODE
             image_urls = job_input.get("image_urls")
             custom_prompt = job_input.get("prompt")
 
             if not isinstance(image_urls, list) or len(image_urls) == 0:
                 return {"error": "image_urls must be a non-empty array"}
 
-            print(f"[Qwen-VL] Multi-tile URL mode: processing {len(image_urls)} tiles from same page")
+            print(f"[Qwen-VL] Multi-tile URL mode: processing {len(image_urls)} tiles (concurrent handler)")
 
             llm_input, tile_temp_files, sizes = process_multiple_url_images(image_urls, custom_prompt)
             temp_files.extend(tile_temp_files)
@@ -604,8 +464,7 @@ def handler(job):
             total_pixels = sum(s[0] * s[1] for s in sizes)
             print(f"[Qwen-VL] Processing {len(sizes)} tiles, total: {total_pixels/1e6:.1f} MP")
 
-            # Generate response for all tiles together
-            outputs = llm.generate([llm_input], sampling_params=sampling_params)
+            outputs = await run_inference([llm_input])
             markdown = outputs[0].outputs[0].text
 
             if "---END---" not in markdown:
@@ -627,25 +486,22 @@ def handler(job):
                 "model_location": "network_storage" if model_path == MODEL_LOCAL_PATH else "hf_cache"
             }
 
-        # ============================================
-        # MULTI-TILE LOCAL MODE: Process multiple tiles from same page (local paths)
-        # ============================================
         elif job_input.get("image_paths"):
+            # MULTI-TILE LOCAL MODE
             image_paths = job_input.get("image_paths")
             custom_prompt = job_input.get("prompt")
 
             if not isinstance(image_paths, list) or len(image_paths) == 0:
                 return {"error": "image_paths must be a non-empty array"}
 
-            print(f"[Qwen-VL] Multi-tile mode: processing {len(image_paths)} tiles from same page")
+            print(f"[Qwen-VL] Multi-tile mode: processing {len(image_paths)} tiles (concurrent handler)")
 
             llm_input, sizes = process_multiple_local_images(image_paths, custom_prompt)
 
             total_pixels = sum(s[0] * s[1] for s in sizes)
             print(f"[Qwen-VL] Processing {len(sizes)} tiles, total: {total_pixels/1e6:.1f} MP")
 
-            # Generate response for all tiles together
-            outputs = llm.generate([llm_input], sampling_params=sampling_params)
+            outputs = await run_inference([llm_input])
             markdown = outputs[0].outputs[0].text
 
             if "---END---" not in markdown:
@@ -667,21 +523,17 @@ def handler(job):
                 "model_location": "network_storage" if model_path == MODEL_LOCAL_PATH else "hf_cache"
             }
 
-        # ============================================
-        # SINGLE LOCAL PATH MODE: Process one image from local path
-        # ============================================
         elif job_input.get("image_path"):
+            # SINGLE LOCAL PATH MODE
             image_path = job_input.get("image_path")
             custom_prompt = job_input.get("prompt")
 
-            print(f"[Qwen-VL] Single local path mode: {image_path}")
+            print(f"[Qwen-VL] Single local path mode: {image_path} (concurrent handler)")
 
             llm_input, size = process_local_image(image_path, custom_prompt)
-
             print(f"[Qwen-VL] Processing local image: {size[0]}x{size[1]}")
 
-            # Generate response
-            outputs = llm.generate([llm_input], sampling_params=sampling_params)
+            outputs = await run_inference([llm_input])
             markdown = outputs[0].outputs[0].text
 
             if "---END---" not in markdown:
@@ -702,9 +554,7 @@ def handler(job):
             }
 
         else:
-            # ============================================
-            # SINGLE MODE: Process one image (base64 or URL)
-            # ============================================
+            # SINGLE MODE (base64 or URL)
             image_base64 = job_input.get("image_base64")
             image_url = job_input.get("image_url")
             custom_prompt = job_input.get("prompt")
@@ -713,7 +563,7 @@ def handler(job):
                 return {"error": "Missing image_base64, image_url, image_path, or image_paths in input"}
 
             input_mode = "url" if image_url else "base64"
-            print(f"[Qwen-VL] Single mode, input: {input_mode}")
+            print(f"[Qwen-VL] Single mode, input: {input_mode} (concurrent handler)")
 
             llm_input, temp_path, size = process_single_image(
                 image_base64=image_base64,
@@ -724,8 +574,7 @@ def handler(job):
 
             print(f"[Qwen-VL] Processing single image: {size[0]}x{size[1]}")
 
-            # Generate response
-            outputs = llm.generate([llm_input], sampling_params=sampling_params)
+            outputs = await run_inference([llm_input])
             markdown = outputs[0].outputs[0].text
 
             if "---END---" not in markdown:
@@ -755,11 +604,22 @@ def handler(job):
         }
 
     finally:
-        # Clean up all temp files
         for temp_path in temp_files:
             if os.path.exists(temp_path):
                 os.unlink(temp_path)
 
 
-# Start RunPod serverless handler
-runpod.serverless.start({"handler": handler})
+def concurrency_modifier(current_concurrency: int) -> int:
+    """
+    Allow up to MAX_CONCURRENCY concurrent jobs.
+    Qwen 30B 8-bit uses ~30GB on 48GB GPU, leaving ~18GB.
+    Each inference needs ~1-2GB KV-cache. 5 concurrent = ~40GB peak.
+    """
+    return MAX_CONCURRENCY
+
+
+# Start RunPod serverless handler with concurrency support
+runpod.serverless.start({
+    "handler": handler,
+    "concurrency_modifier": concurrency_modifier
+})
