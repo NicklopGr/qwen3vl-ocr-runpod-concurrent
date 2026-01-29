@@ -34,10 +34,10 @@ ENV MAX_CONCURRENCY=5
 
 # Default model - can be overridden in RunPod endpoint settings
 # Options:
+#   QuantTrio/Qwen3-VL-32B-Instruct-AWQ       (~17GB, 8-bit AWQ, 32B dense)
 #   QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ  (~17GB, 8-bit AWQ, MoE 30B/3B active)
-#   Qwen/Qwen2.5-VL-32B-Instruct-AWQ         (~17GB, 8-bit AWQ)
 #   Qwen/Qwen3-VL-8B-Instruct-FP8            (~8GB, FP8 quantized)
-ENV MODEL_NAME="QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ"
+ENV MODEL_NAME="QuantTrio/Qwen3-VL-32B-Instruct-AWQ"
 
 # NOTE: Model is NOT pre-downloaded in this image
 # Model will be downloaded to /runpod-volume/models/ on first run
