@@ -23,6 +23,8 @@ COPY handler.py /app/handler.py
 # RunPod configuration
 ENV RUNPOD_DEBUG_LEVEL=INFO
 ENV PYTHONUNBUFFERED=1
+ENV VLLM_DISABLE_MODEL_SOURCE_CHECK=1
+ENV VLLM_CACHE_ROOT=/runpod-volume/vllm_cache
 
 # Extended timeout for first-time model download to network storage
 # First cold start may take 5-10 minutes to download 30B+ model

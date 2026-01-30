@@ -22,6 +22,7 @@ import time
 import tempfile
 import os
 import requests
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from PIL import Image
 
@@ -34,6 +35,9 @@ TENSOR_PARALLEL_SIZE = int(os.environ.get("TENSOR_PARALLEL_SIZE", "1"))
 MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "5"))
 
 # Convert model name to safe directory name
+# Thread pool for parallel image downloads
+_download_pool = ThreadPoolExecutor(max_workers=8)
+
 MODEL_DIR_NAME = MODEL_NAME.replace("/", "--")
 MODEL_LOCAL_PATH = os.path.join(NETWORK_VOLUME, "models", MODEL_DIR_NAME)
 
@@ -278,9 +282,13 @@ def process_multiple_url_images(image_urls: list, custom_prompt: str = None):
     sizes = []
     temp_files = []
 
-    for i, url in enumerate(image_urls):
-        print(f"[Qwen-VL] Downloading tile {i+1}/{len(image_urls)} from URL...")
-        image_data = download_image_from_url(url)
+    # Download all tiles in parallel
+    print(f"[Qwen-VL] Downloading {len(image_urls)} tiles in parallel...")
+    dl_start = time.time()
+    image_data_list = list(_download_pool.map(download_image_from_url, image_urls))
+    print(f"[Qwen-VL] All {len(image_urls)} tiles downloaded in {time.time() - dl_start:.2f}s")
+
+    for i, image_data in enumerate(image_data_list):
         image = Image.open(io.BytesIO(image_data)).convert("RGB")
         sizes.append(image.size)
 
