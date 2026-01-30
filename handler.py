@@ -41,13 +41,23 @@ _inference_semaphore: asyncio.Semaphore | None = None
 
 
 def download_model_to_network_storage():
-    """Download model to network storage if not already present."""
+    """Download model to network storage if not already present.
+    Cleans up any other models on the network volume to free space."""
     model_path = Path(MODEL_LOCAL_PATH)
 
     if not os.path.exists(NETWORK_VOLUME):
         print(f"[WARNING] Network volume not mounted at {NETWORK_VOLUME}")
         print(f"[WARNING] Falling back to HuggingFace cache (slower cold starts)")
         return MODEL_NAME
+
+    # Clean up old/different models from network volume
+    models_dir = Path(NETWORK_VOLUME) / "models"
+    if models_dir.exists():
+        for existing in models_dir.iterdir():
+            if existing.is_dir() and existing.name != MODEL_DIR_NAME:
+                import shutil
+                print(f"[Qwen-VL] Removing old model: {existing.name}")
+                shutil.rmtree(existing, ignore_errors=True)
 
     if model_path.exists() and any(model_path.iterdir()):
         print(f"[Qwen-VL] Model found on network storage: {MODEL_LOCAL_PATH}")
