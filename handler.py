@@ -6,11 +6,11 @@ Multiple jobs can run simultaneously on the same GPU worker.
 
 Key differences from original:
 - async def handler() instead of sync
-- concurrency_modifier returns MAX_CONCURRENCY (default 5)
+- concurrency_modifier returns MAX_CONCURRENCY (default 9)
 - asyncio.Semaphore wraps each inference call to limit GPU pressure
 - Each image processed as separate inference (no multi-image combining per job)
 
-Model: QuantTrio/Qwen3-VL-32B-Instruct-AWQ (32B dense, 8-bit AWQ)
+Model: QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ (30B MoE, 3B active, 8-bit AWQ)
 Framework: vLLM with tensor_parallel_size=1, max_model_len=14336
 """
 
@@ -30,9 +30,9 @@ from PIL import Image
 # CONFIGURATION
 # ============================================
 NETWORK_VOLUME = "/runpod-volume"
-MODEL_NAME = os.environ.get("MODEL_NAME", "QuantTrio/Qwen3-VL-32B-Instruct-AWQ")
+MODEL_NAME = os.environ.get("MODEL_NAME", "QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ")
 TENSOR_PARALLEL_SIZE = int(os.environ.get("TENSOR_PARALLEL_SIZE", "1"))
-MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "5"))
+MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "9"))
 
 # Convert model name to safe directory name
 # Thread pool for parallel image downloads
@@ -620,8 +620,8 @@ async def handler(job):
 def concurrency_modifier(current_concurrency: int) -> int:
     """
     Allow up to MAX_CONCURRENCY concurrent jobs.
-    Qwen3-VL-32B 8-bit AWQ uses ~17GB on 48GB GPU, leaving ~31GB.
-    Each inference needs ~1-2GB KV-cache. 5 concurrent = ~27GB peak.
+    Qwen3-VL-30B-A3B MoE (8-bit AWQ) only activates 3B params per token.
+    Low VRAM footprint allows 9 concurrent inferences on a 44GB+ GPU.
     """
     return MAX_CONCURRENCY
 
