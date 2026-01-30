@@ -1,14 +1,14 @@
 """
 Qwen3-VL RunPod Serverless Handler (Concurrent Version)
 
-Same model and I/O schema as qwen3vl-ocr-runpod but with in-handler concurrency.
-Multiple jobs can run simultaneously on the same GPU worker.
+1 image = 1 page. No tiling, no multi-image combining.
+Multiple jobs run simultaneously on the same GPU worker via concurrency_modifier.
 
-Key differences from original:
-- async def handler() instead of sync
+Key design:
+- async def handler() with asyncio.Semaphore for GPU pressure control
 - concurrency_modifier returns MAX_CONCURRENCY (default 9)
-- asyncio.Semaphore wraps each inference call to limit GPU pressure
-- Each image processed as separate inference (no multi-image combining per job)
+- Batch mode: multiple single-image inferences in one job
+- Single mode: one image per job
 
 Model: QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ (30B MoE, 3B active, 8-bit AWQ)
 Framework: vLLM with tensor_parallel_size=1, max_model_len=14336
@@ -22,7 +22,6 @@ import time
 import tempfile
 import os
 import requests
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from PIL import Image
 
@@ -33,10 +32,6 @@ NETWORK_VOLUME = "/runpod-volume"
 MODEL_NAME = os.environ.get("MODEL_NAME", "QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ")
 TENSOR_PARALLEL_SIZE = int(os.environ.get("TENSOR_PARALLEL_SIZE", "1"))
 MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "9"))
-
-# Convert model name to safe directory name
-# Thread pool for parallel image downloads
-_download_pool = ThreadPoolExecutor(max_workers=8)
 
 MODEL_DIR_NAME = MODEL_NAME.replace("/", "--")
 MODEL_LOCAL_PATH = os.path.join(NETWORK_VOLUME, "models", MODEL_DIR_NAME)
@@ -104,7 +99,7 @@ llm = LLM(
     dtype="auto",
     tensor_parallel_size=TENSOR_PARALLEL_SIZE,
     distributed_executor_backend="mp",
-    limit_mm_per_prompt={"image": 4},
+    limit_mm_per_prompt={"image": 1},
     quantization="awq_marlin" if "AWQ" in MODEL_NAME.upper() else None,
 )
 
@@ -195,135 +190,6 @@ def download_image_from_url(url: str, timeout: int = 60) -> bytes:
     return response.content
 
 
-def validate_local_path(path: str) -> bool:
-    """Validate that a local path is safe (within allowed directories)."""
-    allowed_prefixes = ["/runpod-volume/", "/tmp/"]
-    return any(path.startswith(prefix) for prefix in allowed_prefixes) and os.path.exists(path)
-
-
-def process_local_image(image_path: str, custom_prompt: str = None):
-    """Process a single image from local path. Returns llm_input and image size."""
-    if not validate_local_path(image_path):
-        raise ValueError(f"Invalid or non-existent local path: {image_path}")
-
-    image = Image.open(image_path).convert("RGB")
-    size = image.size
-    prompt = custom_prompt if custom_prompt else BANK_STATEMENT_PROMPT
-
-    messages = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "image", "image": image_path},
-                {"type": "text", "text": prompt}
-            ]
-        }
-    ]
-
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    image_inputs, video_inputs, video_kwargs = process_vision_info(messages, return_video_kwargs=True)
-
-    llm_input = {
-        "prompt": text,
-        "multi_modal_data": {"image": image_inputs}
-    }
-
-    return llm_input, size
-
-
-def process_multiple_local_images(image_paths: list, custom_prompt: str = None):
-    """Process multiple tiles from same page in a single inference."""
-    if not image_paths:
-        raise ValueError("No image paths provided")
-
-    for path in image_paths:
-        if not validate_local_path(path):
-            raise ValueError(f"Invalid or non-existent local path: {path}")
-
-    content = []
-    sizes = []
-
-    for path in image_paths:
-        image = Image.open(path).convert("RGB")
-        sizes.append(image.size)
-        content.append({"type": "image", "image": path})
-
-    prompt = custom_prompt if custom_prompt else BANK_STATEMENT_PROMPT
-    multi_tile_prompt = f"""These {len(image_paths)} images are TILES from the SAME PAGE of a bank statement.
-They overlap slightly at the edges. Extract transactions as if viewing ONE continuous page.
-
-IMPORTANT:
-- Do NOT duplicate transactions that appear in the overlap regions
-- Maintain context from headers visible in any tile
-- Output ONE unified result for the entire page
-
-{prompt}"""
-
-    content.append({"type": "text", "text": multi_tile_prompt})
-    messages = [{"role": "user", "content": content}]
-
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    image_inputs, video_inputs, video_kwargs = process_vision_info(messages, return_video_kwargs=True)
-
-    llm_input = {
-        "prompt": text,
-        "multi_modal_data": {"image": image_inputs}
-    }
-
-    return llm_input, sizes
-
-
-def process_multiple_url_images(image_urls: list, custom_prompt: str = None):
-    """Process multiple tiles from URLs in a single inference."""
-    if not image_urls:
-        raise ValueError("No image URLs provided")
-
-    content = []
-    sizes = []
-    temp_files = []
-
-    # Download all tiles in parallel
-    print(f"[Qwen-VL] Downloading {len(image_urls)} tiles in parallel...")
-    dl_start = time.time()
-    image_data_list = list(_download_pool.map(download_image_from_url, image_urls))
-    print(f"[Qwen-VL] All {len(image_urls)} tiles downloaded in {time.time() - dl_start:.2f}s")
-
-    for i, image_data in enumerate(image_data_list):
-        image = Image.open(io.BytesIO(image_data)).convert("RGB")
-        sizes.append(image.size)
-
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp_file:
-            image.save(tmp_file, format="PNG")
-            temp_path = tmp_file.name
-            temp_files.append(temp_path)
-
-        content.append({"type": "image", "image": temp_path})
-
-    prompt = custom_prompt if custom_prompt else BANK_STATEMENT_PROMPT
-    multi_tile_prompt = f"""These {len(image_urls)} images are TILES from the SAME PAGE of a bank statement.
-They overlap slightly at the edges. Extract transactions as if viewing ONE continuous page.
-
-IMPORTANT:
-- Do NOT duplicate transactions that appear in the overlap regions
-- Maintain context from headers visible in any tile
-- Output ONE unified result for the entire page
-
-{prompt}"""
-
-    content.append({"type": "text", "text": multi_tile_prompt})
-    messages = [{"role": "user", "content": content}]
-
-    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    image_inputs, video_inputs, video_kwargs = process_vision_info(messages, return_video_kwargs=True)
-
-    llm_input = {
-        "prompt": text,
-        "multi_modal_data": {"image": image_inputs}
-    }
-
-    return llm_input, temp_files, sizes
-
-
 def process_single_image(image_base64=None, image_url=None, custom_prompt=None):
     """Process a single image from base64 or URL. Returns llm_input, temp_path, size."""
     if image_url:
@@ -382,9 +248,11 @@ async def run_inference(llm_inputs):
 async def handler(job):
     """
     Process bank statement images with Qwen-VL (async, concurrent-capable).
+    1 image = 1 page. No tiling or multi-image combining.
 
-    Same I/O schema as original handler. Multiple jobs run simultaneously
-    on the same worker, with GPU inference serialized by semaphore.
+    Supports:
+    - Batch mode: {"images": [{"image_base64": ...}, {"image_url": ...}]}
+    - Single mode: {"image_base64": ...} or {"image_url": ...}
     """
     start_time = time.time()
     temp_files = []
@@ -394,7 +262,7 @@ async def handler(job):
         images_batch = job_input.get("images")
 
         if images_batch and isinstance(images_batch, list):
-            # BATCH MODE
+            # BATCH MODE: multiple single-image inferences
             print(f"[Qwen-VL] Batch mode: processing {len(images_batch)} images (concurrent handler)")
 
             first_img = images_batch[0] if images_batch else {}
@@ -456,111 +324,6 @@ async def handler(job):
                 "model_location": "network_storage" if model_path == MODEL_LOCAL_PATH else "hf_cache"
             }
 
-        elif job_input.get("image_urls"):
-            # MULTI-TILE URL MODE
-            image_urls = job_input.get("image_urls")
-            custom_prompt = job_input.get("prompt")
-
-            if not isinstance(image_urls, list) or len(image_urls) == 0:
-                return {"error": "image_urls must be a non-empty array"}
-
-            print(f"[Qwen-VL] Multi-tile URL mode: processing {len(image_urls)} tiles (concurrent handler)")
-
-            llm_input, tile_temp_files, sizes = process_multiple_url_images(image_urls, custom_prompt)
-            temp_files.extend(tile_temp_files)
-
-            total_pixels = sum(s[0] * s[1] for s in sizes)
-            print(f"[Qwen-VL] Processing {len(sizes)} tiles, total: {total_pixels/1e6:.1f} MP")
-
-            outputs = await run_inference([llm_input])
-            markdown = outputs[0].outputs[0].text
-
-            if "---END---" not in markdown:
-                markdown += "\n---END---"
-
-            processing_time = time.time() - start_time
-            print(f"[Qwen-VL] Multi-tile URL completed in {processing_time:.2f}s, output: {len(markdown)} chars")
-
-            return {
-                "status": "success",
-                "mode": "multi_tile_url",
-                "markdown": markdown,
-                "tile_count": len(image_urls),
-                "tile_sizes": [f"{s[0]}x{s[1]}" for s in sizes],
-                "total_megapixels": round(total_pixels / 1e6, 2),
-                "processing_time": processing_time,
-                "pipeline": f"qwen-vl ({MODEL_NAME})",
-                "tensor_parallel_size": TENSOR_PARALLEL_SIZE,
-                "model_location": "network_storage" if model_path == MODEL_LOCAL_PATH else "hf_cache"
-            }
-
-        elif job_input.get("image_paths"):
-            # MULTI-TILE LOCAL MODE
-            image_paths = job_input.get("image_paths")
-            custom_prompt = job_input.get("prompt")
-
-            if not isinstance(image_paths, list) or len(image_paths) == 0:
-                return {"error": "image_paths must be a non-empty array"}
-
-            print(f"[Qwen-VL] Multi-tile mode: processing {len(image_paths)} tiles (concurrent handler)")
-
-            llm_input, sizes = process_multiple_local_images(image_paths, custom_prompt)
-
-            total_pixels = sum(s[0] * s[1] for s in sizes)
-            print(f"[Qwen-VL] Processing {len(sizes)} tiles, total: {total_pixels/1e6:.1f} MP")
-
-            outputs = await run_inference([llm_input])
-            markdown = outputs[0].outputs[0].text
-
-            if "---END---" not in markdown:
-                markdown += "\n---END---"
-
-            processing_time = time.time() - start_time
-            print(f"[Qwen-VL] Multi-tile completed in {processing_time:.2f}s, output: {len(markdown)} chars")
-
-            return {
-                "status": "success",
-                "mode": "multi_tile",
-                "markdown": markdown,
-                "tile_count": len(image_paths),
-                "tile_sizes": [f"{s[0]}x{s[1]}" for s in sizes],
-                "total_megapixels": round(total_pixels / 1e6, 2),
-                "processing_time": processing_time,
-                "pipeline": f"qwen-vl ({MODEL_NAME})",
-                "tensor_parallel_size": TENSOR_PARALLEL_SIZE,
-                "model_location": "network_storage" if model_path == MODEL_LOCAL_PATH else "hf_cache"
-            }
-
-        elif job_input.get("image_path"):
-            # SINGLE LOCAL PATH MODE
-            image_path = job_input.get("image_path")
-            custom_prompt = job_input.get("prompt")
-
-            print(f"[Qwen-VL] Single local path mode: {image_path} (concurrent handler)")
-
-            llm_input, size = process_local_image(image_path, custom_prompt)
-            print(f"[Qwen-VL] Processing local image: {size[0]}x{size[1]}")
-
-            outputs = await run_inference([llm_input])
-            markdown = outputs[0].outputs[0].text
-
-            if "---END---" not in markdown:
-                markdown += "\n---END---"
-
-            processing_time = time.time() - start_time
-            print(f"[Qwen-VL] Completed in {processing_time:.2f}s, output: {len(markdown)} chars")
-
-            return {
-                "status": "success",
-                "mode": "single_local",
-                "markdown": markdown,
-                "image_size": f"{size[0]}x{size[1]}",
-                "processing_time": processing_time,
-                "pipeline": f"qwen-vl ({MODEL_NAME})",
-                "tensor_parallel_size": TENSOR_PARALLEL_SIZE,
-                "model_location": "network_storage" if model_path == MODEL_LOCAL_PATH else "hf_cache"
-            }
-
         else:
             # SINGLE MODE (base64 or URL)
             image_base64 = job_input.get("image_base64")
@@ -568,7 +331,7 @@ async def handler(job):
             custom_prompt = job_input.get("prompt")
 
             if not image_base64 and not image_url:
-                return {"error": "Missing image_base64, image_url, image_path, or image_paths in input"}
+                return {"error": "Missing image_base64, image_url, or images in input"}
 
             input_mode = "url" if image_url else "base64"
             print(f"[Qwen-VL] Single mode, input: {input_mode} (concurrent handler)")
