@@ -31,7 +31,7 @@ from PIL import Image
 NETWORK_VOLUME = "/runpod-volume"
 MODEL_NAME = os.environ.get("MODEL_NAME", "QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ")
 TENSOR_PARALLEL_SIZE = int(os.environ.get("TENSOR_PARALLEL_SIZE", "1"))
-MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "9"))
+MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "3"))
 
 MODEL_DIR_NAME = MODEL_NAME.replace("/", "--")
 MODEL_LOCAL_PATH = os.path.join(NETWORK_VOLUME, "models", MODEL_DIR_NAME)
@@ -394,7 +394,7 @@ def concurrency_modifier(current_concurrency: int) -> int:
     """
     Allow up to MAX_CONCURRENCY concurrent jobs.
     Qwen3-VL-30B-A3B MoE (8-bit AWQ) only activates 3B params per token.
-    Low VRAM footprint allows 9 concurrent inferences on a 44GB+ GPU.
+    3 concurrent inferences balances throughput and KV cache pressure.
     """
     return MAX_CONCURRENCY
 
