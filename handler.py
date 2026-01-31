@@ -10,8 +10,8 @@ Key design:
 - Batch mode: multiple single-image inferences in one job
 - Single mode: one image per job
 
-Model: QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ (30B MoE, 3B active, 8-bit AWQ)
-Framework: vLLM with tensor_parallel_size=1, max_model_len=14336
+Model: Qwen/Qwen3-VL-8B-Instruct-FP8 (8B dense, FP8 quantized, ~8GB VRAM)
+Framework: vLLM with tensor_parallel_size=1, max_model_len=16384
 """
 
 import runpod
@@ -29,7 +29,7 @@ from PIL import Image
 # CONFIGURATION
 # ============================================
 NETWORK_VOLUME = "/runpod-volume"
-MODEL_NAME = os.environ.get("MODEL_NAME", "QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ")
+MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen3-VL-8B-Instruct-FP8")
 TENSOR_PARALLEL_SIZE = int(os.environ.get("TENSOR_PARALLEL_SIZE", "1"))
 MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "3"))
 
@@ -104,13 +104,13 @@ processor = AutoProcessor.from_pretrained(model_path, trust_remote_code=True)
 llm = LLM(
     model=model_path,
     trust_remote_code=True,
-    max_model_len=14336,
+    max_model_len=16384,
     gpu_memory_utilization=0.95,
     dtype="auto",
     tensor_parallel_size=TENSOR_PARALLEL_SIZE,
     distributed_executor_backend="mp",
     limit_mm_per_prompt={"image": 1},
-    quantization="awq_marlin" if "AWQ" in MODEL_NAME.upper() else None,
+    quantization="fp8" if "FP8" in MODEL_NAME.upper() else ("awq_marlin" if "AWQ" in MODEL_NAME.upper() else None),
 )
 
 print(f"[Qwen-VL] Model loaded in {time.time() - start_load:.2f}s across {TENSOR_PARALLEL_SIZE} GPUs")
@@ -393,8 +393,8 @@ async def handler(job):
 def concurrency_modifier(current_concurrency: int) -> int:
     """
     Allow up to MAX_CONCURRENCY concurrent jobs.
-    Qwen3-VL-30B-A3B MoE (8-bit AWQ) only activates 3B params per token.
-    3 concurrent inferences balances throughput and KV cache pressure.
+    Qwen3-VL-8B FP8 uses ~8GB on 48GB GPU, leaving ~40GB.
+    Each inference needs ~1-2GB KV-cache. 5 concurrent = ~18GB peak.
     """
     return MAX_CONCURRENCY
 
