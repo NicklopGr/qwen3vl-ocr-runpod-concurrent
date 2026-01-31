@@ -32,7 +32,7 @@ ENV VLLM_CACHE_ROOT=/runpod-volume/vllm_cache
 ENV RUNPOD_INIT_TIMEOUT=900
 
 # Maximum concurrent jobs per worker (default 5 for 30B model on 48GB GPU)
-ENV MAX_CONCURRENCY=9
+ENV MAX_CONCURRENCY=3
 
 # Default model - can be overridden in RunPod endpoint settings
 # Options:
