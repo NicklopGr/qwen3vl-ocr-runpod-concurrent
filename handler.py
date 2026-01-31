@@ -112,6 +112,7 @@ llm = LLM(
     model=model_path,
     trust_remote_code=True,
     max_model_len=16384,
+    max_num_seqs=MAX_CONCURRENCY * 2,    # Allow 2x concurrency for sequence scheduling headroom
     gpu_memory_utilization=0.95,
     dtype="auto",
     tensor_parallel_size=TENSOR_PARALLEL_SIZE,
@@ -252,10 +253,23 @@ def process_single_image(image_base64=None, image_url=None, custom_prompt=None):
 # Single background task that drains the queue and calls llm.generate() once per batch.
 # This avoids the thread-safety issue with concurrent llm.generate() calls.
 
+def _run_generate(llm_inputs):
+    """Synchronous generate — runs in a single dedicated thread to keep event loop free."""
+    return llm.generate(llm_inputs, sampling_params=sampling_params)
+
+
 async def _batch_inference_loop():
-    """Background task: collect queued requests, run ONE llm.generate() per batch."""
+    """Background task: collect queued requests, run ONE llm.generate() per batch.
+
+    generate() is blocking (30-60s for vision batches), so we run it in a
+    ThreadPoolExecutor.  Only this loop ever calls generate(), so there is
+    never more than one concurrent call — thread-safety is preserved while
+    the event loop stays responsive for new RunPod jobs arriving.
+    """
     global _inference_queue
-    print(f"[Qwen-VL] Batch inference loop started (wait={BATCH_WAIT_SECONDS}s)")
+    print(f"[Qwen-VL] Batch inference loop started (wait={BATCH_WAIT_SECONDS}s, max_concurrency={MAX_CONCURRENCY})")
+
+    loop = asyncio.get_event_loop()
 
     while True:
         # Wait for at least one request
@@ -279,8 +293,9 @@ async def _batch_inference_loop():
         gen_start = time.time()
 
         try:
-            # SINGLE call to llm.generate() with all prompts — thread-safe
-            outputs = llm.generate(llm_inputs, sampling_params=sampling_params)
+            # Run in executor so event loop stays responsive for new jobs
+            # Only ONE thread ever calls generate() — thread-safety preserved
+            outputs = await loop.run_in_executor(None, _run_generate, llm_inputs)
             gen_time = time.time() - gen_start
             print(f"[Qwen-VL] Batch generate done: {len(outputs)} outputs in {gen_time:.2f}s")
 
