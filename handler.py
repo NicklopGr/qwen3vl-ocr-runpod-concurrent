@@ -5,10 +5,10 @@ Qwen3-VL RunPod Serverless Handler (Concurrent Version)
 Multiple jobs run simultaneously on the same GPU worker via concurrency_modifier.
 
 Key design:
-- async def handler() with asyncio.Semaphore for GPU pressure control
-- concurrency_modifier returns MAX_CONCURRENCY (default 9)
-- Batch mode: multiple single-image inferences in one job
-- Single mode: one image per job
+- concurrency_modifier allows multiple RunPod jobs on the same worker
+- All inference requests are collected into a single queue
+- A background task batches queued requests into ONE llm.generate() call
+- vLLM's LLM.generate() is NOT thread-safe; we never call it from multiple threads
 
 Model: Qwen/Qwen3-VL-8B-Instruct-FP8 (8B dense, FP8 quantized, ~8GB VRAM)
 Framework: vLLM with tensor_parallel_size=1, max_model_len=16384
@@ -31,13 +31,20 @@ from PIL import Image
 NETWORK_VOLUME = "/runpod-volume"
 MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen3-VL-8B-Instruct-FP8")
 TENSOR_PARALLEL_SIZE = int(os.environ.get("TENSOR_PARALLEL_SIZE", "1"))
-MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "3"))
+MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "5"))
+
+# How long (seconds) the batch processor waits to collect more requests before firing
+BATCH_WAIT_SECONDS = float(os.environ.get("BATCH_WAIT_SECONDS", "0.5"))
 
 MODEL_DIR_NAME = MODEL_NAME.replace("/", "--")
 MODEL_LOCAL_PATH = os.path.join(NETWORK_VOLUME, "models", MODEL_DIR_NAME)
 
-# Semaphore to limit concurrent inference calls on GPU
-_inference_semaphore: asyncio.Semaphore | None = None
+# ============================================
+# INFERENCE QUEUE (single-writer pattern)
+# ============================================
+# Each item: {"llm_input": dict, "future": asyncio.Future}
+_inference_queue: asyncio.Queue | None = None
+_batch_processor_task: asyncio.Task | None = None
 
 
 def download_model_to_network_storage():
@@ -239,21 +246,87 @@ def process_single_image(image_base64=None, image_url=None, custom_prompt=None):
     return llm_input, temp_image_path, image.size
 
 
-def run_inference_sync(llm_inputs):
-    """Synchronous wrapper for vLLM inference (called from executor)."""
-    return llm.generate(llm_inputs, sampling_params=sampling_params)
+# ============================================
+# BATCH INFERENCE PROCESSOR
+# ============================================
+# Single background task that drains the queue and calls llm.generate() once per batch.
+# This avoids the thread-safety issue with concurrent llm.generate() calls.
+
+async def _batch_inference_loop():
+    """Background task: collect queued requests, run ONE llm.generate() per batch."""
+    global _inference_queue
+    print(f"[Qwen-VL] Batch inference loop started (wait={BATCH_WAIT_SECONDS}s)")
+
+    while True:
+        # Wait for at least one request
+        first_item = await _inference_queue.get()
+        batch = [first_item]
+
+        # Collect more requests that arrived while we waited
+        await asyncio.sleep(BATCH_WAIT_SECONDS)
+        while not _inference_queue.empty():
+            try:
+                item = _inference_queue.get_nowait()
+                batch.append(item)
+            except asyncio.QueueEmpty:
+                break
+
+        # Build a single list of llm_inputs for one generate() call
+        llm_inputs = [item["llm_input"] for item in batch]
+        futures = [item["future"] for item in batch]
+
+        print(f"[Qwen-VL] Batch generate: {len(llm_inputs)} prompts")
+        gen_start = time.time()
+
+        try:
+            # SINGLE call to llm.generate() with all prompts — thread-safe
+            outputs = llm.generate(llm_inputs, sampling_params=sampling_params)
+            gen_time = time.time() - gen_start
+            print(f"[Qwen-VL] Batch generate done: {len(outputs)} outputs in {gen_time:.2f}s")
+
+            # Distribute results back to each waiting job
+            for future, output in zip(futures, outputs):
+                if not future.cancelled():
+                    future.set_result(output)
+        except Exception as e:
+            print(f"[Qwen-VL] Batch generate error: {e}")
+            for future in futures:
+                if not future.cancelled():
+                    future.set_exception(e)
 
 
-async def run_inference(llm_inputs):
-    """Run vLLM inference with semaphore to limit concurrent GPU pressure."""
-    global _inference_semaphore
-    if _inference_semaphore is None:
-        _inference_semaphore = asyncio.Semaphore(MAX_CONCURRENCY)
+def _ensure_batch_processor():
+    """Lazily start the batch processor on first request."""
+    global _inference_queue, _batch_processor_task
+    if _inference_queue is None:
+        _inference_queue = asyncio.Queue()
+    if _batch_processor_task is None or _batch_processor_task.done():
+        _batch_processor_task = asyncio.get_event_loop().create_task(_batch_inference_loop())
 
-    async with _inference_semaphore:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, run_inference_sync, llm_inputs)
 
+async def run_inference_single(llm_input):
+    """Queue a single prompt and await its result."""
+    _ensure_batch_processor()
+    future = asyncio.get_event_loop().create_future()
+    await _inference_queue.put({"llm_input": llm_input, "future": future})
+    return await future
+
+
+async def run_inference_batch(llm_inputs):
+    """Queue multiple prompts and await all results (preserving order)."""
+    _ensure_batch_processor()
+    loop = asyncio.get_event_loop()
+    futures = []
+    for inp in llm_inputs:
+        future = loop.create_future()
+        await _inference_queue.put({"llm_input": inp, "future": future})
+        futures.append(future)
+    return await asyncio.gather(*futures)
+
+
+# ============================================
+# RUNPOD HANDLER
+# ============================================
 
 async def handler(job):
     """
@@ -272,7 +345,7 @@ async def handler(job):
         images_batch = job_input.get("images")
 
         if images_batch and isinstance(images_batch, list):
-            # BATCH MODE: multiple single-image inferences
+            # BATCH MODE: multiple images in one job
             print(f"[Qwen-VL] Batch mode: processing {len(images_batch)} images (concurrent handler)")
 
             first_img = images_batch[0] if images_batch else {}
@@ -304,8 +377,8 @@ async def handler(job):
             if not llm_inputs:
                 return {"error": "No valid images in batch"}
 
-            print(f"[Qwen-VL] Running batch inference on {len(llm_inputs)} images...")
-            outputs = await run_inference(llm_inputs)
+            print(f"[Qwen-VL] Queuing batch of {len(llm_inputs)} images for inference...")
+            outputs = await run_inference_batch(llm_inputs)
 
             results = []
             for i, output in enumerate(outputs):
@@ -355,8 +428,8 @@ async def handler(job):
 
             print(f"[Qwen-VL] Processing single image: {size[0]}x{size[1]}")
 
-            outputs = await run_inference([llm_input])
-            markdown = outputs[0].outputs[0].text
+            output = await run_inference_single(llm_input)
+            markdown = output.outputs[0].text
 
             if "---END---" not in markdown:
                 markdown += "\n---END---"
@@ -393,8 +466,8 @@ async def handler(job):
 def concurrency_modifier(current_concurrency: int) -> int:
     """
     Allow up to MAX_CONCURRENCY concurrent jobs.
-    Qwen3-VL-8B FP8 uses ~8GB on 48GB GPU, leaving ~40GB.
-    Each inference needs ~1-2GB KV-cache. 5 concurrent = ~18GB peak.
+    Jobs queue their inference requests; the batch processor runs them
+    in a single llm.generate() call, so concurrency is safe.
     """
     return MAX_CONCURRENCY
 
