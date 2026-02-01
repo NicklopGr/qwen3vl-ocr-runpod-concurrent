@@ -129,9 +129,9 @@ print(f"[Qwen-VL] Model loaded in {time.time() - start_load:.2f}s across {TENSOR
 
 BANK_STATEMENT_PROMPT = """Extract data from this bank statement image.
 
-STEP 0 — TABLE GEOMETRY (NO SEMANTICS)
-Identify the table columns by their visual boundaries.
-Report the columns in left-to-right order with exact header text.
+STEP 0 — COLUMN BOUNDARIES (GEOMETRY FIRST)
+Identify the table columns by their visual boundaries and header text.
+For each column, infer its left/right boundary from the header position.
 
 HEADERS (left→right):
 H1: "..."
@@ -140,6 +140,12 @@ H3: "..."
 H4: "..."
 H5: "..."
 
+Assign each numeric cell by x-center ONLY:
+
+If a number's x-center falls within a column boundary, it belongs to that column.
+If it falls outside all boundaries, leave the amount blank and tag [AMBIG].
+Never move an amount across columns.
+
 STEP 1 — MAP HEADERS TO SEMANTIC COLUMNS
 DATE_COL = H?
 DESC_COL = H?
@@ -147,23 +153,24 @@ DEBIT_COL = H? (withdrawals, debits, cheques, payments, money out)
 CREDIT_COL = H? (deposits, credits, receipts, money in)
 BALANCE_COL = H?
 
-CRITICAL: The only source of Debit vs Credit is the column position from headers.
-Never move an amount across columns based on description text.
+STRICT NO-SEMANTICS RULE:
+Ignore description text for debit/credit classification.
+Even if description says "deposit" or "withdrawal", do NOT move amounts across columns.
 
 STEP 2 — RAW ROW TRANSCRIPTION (GRID CAPTURE)
-For each visual row in the table, capture one row of cells by column position:
+Before any interpretation, output raw rows with cells in strict column order:
 RowN = [H1 cell, H2 cell, H3 cell, H4 cell, H5 cell]
 If a cell is empty, use "" (blank).
 Do NOT merge or interpret yet.
 
 STEP 3 — MERGE CONTINUATION LINES
-A continuation line is a row with no amount in DEBIT_COL or CREDIT_COL.
+A continuation line is a row with NO amount in DEBIT_COL or CREDIT_COL.
 Merge its description cell into the previous transaction's Description.
 Ignore continuation text in non-description columns.
 
 STEP 4 — OUTPUT TRANSACTIONS
-Output one row per transaction (must have a debit or credit amount).
-Use values from the raw grid only (no shifting).
+Output one row per transaction (must have Debit or Credit).
+Use values only from the raw grid (no shifting).
 Include Balance only if that row shows a balance.
 
 Output format:
@@ -178,6 +185,13 @@ Closing_Balance: [if explicitly shown]
 Date | Description | Debit | Credit | Balance
 [ONE ROW PER TRANSACTION]
 ---END---
+
+PAGE CHECK (END OF EACH PAGE):
+Re-read the header row and the last 5 transaction rows.
+Confirm each amount sits under the correct header by x-position.
+If any row seems misaligned, list it under:
+RECHECK_ROWS: [Row numbers or raw row text]
+Do NOT move amounts to "fix" alignment.
 
 RULES (STRICT):
 
