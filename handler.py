@@ -129,39 +129,42 @@ print(f"[Qwen-VL] Model loaded in {time.time() - start_load:.2f}s across {TENSOR
 
 BANK_STATEMENT_PROMPT = """Extract data from this bank statement image.
 
-STEP 1 - READ THE COLUMN HEADERS:
-Look at the table header row. Identify each column by reading its header text exactly.
-Bank statements typically have columns for: Date, Description, Debits/Withdrawals, Credits/Deposits, Balance.
+STEP 0 — TABLE GEOMETRY (NO SEMANTICS)
+Identify the table columns by their visual boundaries.
+Report the columns in left-to-right order with exact header text.
 
-Report the headers you see:
-HEADERS: [Column1Header, Column2Header, Column3Header, Column4Header, Column5Header]
+HEADERS (left→right):
+H1: "..."
+H2: "..."
+H3: "..."
+H4: "..."
+H5: "..."
 
-Map them to semantic columns:
-- DATE_COL: [position 1-5] = "[header text]"
-- DESC_COL: [position 1-5] = "[header text]"
-- DEBIT_COL: [position 1-5] = "[header text]" (look for: withdrawals, debits, cheques, payments, money out)
-- CREDIT_COL: [position 1-5] = "[header text]" (look for: deposits, credits, receipts, money in)
-- BALANCE_COL: [position 1-5] = "[header text]"
+STEP 1 — MAP HEADERS TO SEMANTIC COLUMNS
+DATE_COL = H?
+DESC_COL = H?
+DEBIT_COL = H? (withdrawals, debits, cheques, payments, money out)
+CREDIT_COL = H? (deposits, credits, receipts, money in)
+BALANCE_COL = H?
 
-STEP 2 - EXTRACT TRANSACTIONS:
-A TRANSACTION is defined as a row that has an AMOUNT (either Debit or Credit).
-For each transaction:
-- Copy values from their source columns to our structured output
-- Value from DEBIT_COL → goes to Debit in output
-- Value from CREDIT_COL → goes to Credit in output
+CRITICAL: The only source of Debit vs Credit is the column position from headers.
+Never move an amount across columns based on description text.
 
-IMPORTANT - MULTI-LINE DESCRIPTIONS:
-Some transactions have descriptions that span multiple lines on the statement.
-You MUST combine them into ONE row in the output:
-- If a transaction's description continues on the next line(s), merge all description text into a single Description field
-- The output must have ONE ROW PER TRANSACTION (one row per amount)
-- Lines without amounts are description continuations - combine them with the transaction they belong to
+STEP 2 — RAW ROW TRANSCRIPTION (GRID CAPTURE)
+For each visual row in the table, capture one row of cells by column position:
+RowN = [H1 cell, H2 cell, H3 cell, H4 cell, H5 cell]
+If a cell is empty, use "" (blank).
+Do NOT merge or interpret yet.
 
-Example: If the statement shows:
-  "15 Apr | PAYROLL DEPOSIT    |        | 5,000.00 |
-         | ACME CORP REF#123  |        |          |"
-Output as ONE row:
-  "15 Apr | PAYROLL DEPOSIT ACME CORP REF#123 | | 5,000.00 |"
+STEP 3 — MERGE CONTINUATION LINES
+A continuation line is a row with no amount in DEBIT_COL or CREDIT_COL.
+Merge its description cell into the previous transaction's Description.
+Ignore continuation text in non-description columns.
+
+STEP 4 — OUTPUT TRANSACTIONS
+Output one row per transaction (must have a debit or credit amount).
+Use values from the raw grid only (no shifting).
+Include Balance only if that row shows a balance.
 
 Output format:
 Bank: [bank name]
@@ -173,26 +176,19 @@ Closing_Balance: [if explicitly shown]
 
 ---TRANSACTIONS---
 Date | Description | Debit | Credit | Balance
-[ONE ROW PER TRANSACTION - combine multi-line descriptions]
+[ONE ROW PER TRANSACTION]
 ---END---
 
-CRITICAL RULES:
-- ONE ROW PER TRANSACTION: Each output row must have an amount (Debit or Credit). Never output rows without amounts.
-- COMBINE DESCRIPTIONS: If description spans multiple lines, merge into single Description field
-- Determine Debit vs Credit ONLY from column headers, NOT from transaction descriptions
-- If column header says "Withdrawals" or "Debits" or "Cheques" → that's the Debit column
-- If column header says "Deposits" or "Credits" → that's the Credit column
-- Copy amounts exactly as they appear (keep formatting like 1,580.00)
-- If a cell is empty, leave it blank between pipes
-- Every row must have its date (if same as previous, still include it)
-- Include ALL visible transactions
-- Do NOT calculate or infer Opening/Closing Balance - only include if explicitly shown
-- If only ONE amount column exists: negative or (parentheses) amounts → Debit, positive → Credit
-- SKIP these non-transaction rows: "Balance Forward", "Opening Balance", "Closing Balance", "Monthly Average", summary lines
-- BALANCE COLUMN: Only include a balance if that SPECIFIC row has a balance printed next to it.
-  - Do NOT repeat the same balance across multiple rows
-  - Do NOT copy closing balance to transaction rows that don't show it
-  - If unsure, leave Balance BLANK
+RULES (STRICT):
+
+One row per transaction = must have Debit or Credit.
+Do NOT infer Debit vs Credit from description.
+Do NOT shift amounts between columns.
+Copy amounts exactly as printed.
+If a row has no amount, it is only a description continuation.
+Skip summary lines (Opening/Closing Balance, Balance Forward, Monthly Average).
+Balance only if that row explicitly shows it.
+If only one amount column exists: negatives/parentheses = Debit, positives = Credit.
 """
 
 sampling_params = SamplingParams(
