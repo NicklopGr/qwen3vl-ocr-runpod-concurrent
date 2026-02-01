@@ -129,44 +129,23 @@ print(f"[Qwen-VL] Model loaded in {time.time() - start_load:.2f}s across {TENSOR
 
 BANK_STATEMENT_PROMPT = """Extract data from this bank statement image.
 
-STEP 0 — TABLE GEOMETRY (NO SEMANTICS)
-Identify the table columns by their visual boundaries.
-Report the columns in left-to-right order with exact header text.
+STEP 0 — TABLE GEOMETRY
+Identify columns by visual boundaries. Report headers left-to-right:
+H1: "..." H2: "..." H3: "..." H4: "..." H5: "..."
 
-HEADERS (left→right):
-H1: "..."
-H2: "..."
-H3: "..."
-H4: "..."
-H5: "..."
+Map to: DATE_COL, DESC_COL, DEBIT_COL (withdrawals/debits/cheques), CREDIT_COL (deposits/credits), BALANCE_COL.
+Debit vs Credit comes ONLY from column position, never from description text.
 
-STEP 1 — MAP HEADERS TO SEMANTIC COLUMNS
-DATE_COL = H?
-DESC_COL = H?
-DEBIT_COL = H? (withdrawals, debits, cheques, payments, money out)
-CREDIT_COL = H? (deposits, credits, receipts, money in)
-BALANCE_COL = H?
+STEP 1 — RAW GRID CAPTURE
+For each table row, capture cells by column position:
+RowN = [H1, H2, H3, H4, H5]
+Empty cell = "". Do not merge or interpret yet.
 
-CRITICAL: The only source of Debit vs Credit is the column position from headers.
-Never move an amount across columns based on description text.
+STEP 2 — MERGE & OUTPUT
+Rows without amounts = description continuations, merge into previous transaction.
+Output one row per transaction (must have Debit or Credit).
+No shifting values between columns.
 
-STEP 2 — RAW ROW TRANSCRIPTION (GRID CAPTURE)
-For each visual row in the table, capture one row of cells by column position:
-RowN = [H1 cell, H2 cell, H3 cell, H4 cell, H5 cell]
-If a cell is empty, use "" (blank).
-Do NOT merge or interpret yet.
-
-STEP 3 — MERGE CONTINUATION LINES
-A continuation line is a row with no amount in DEBIT_COL or CREDIT_COL.
-Merge its description cell into the previous transaction's Description.
-Ignore continuation text in non-description columns.
-
-STEP 4 — OUTPUT TRANSACTIONS
-Output one row per transaction (must have a debit or credit amount).
-Use values from the raw grid only (no shifting).
-Include Balance only if that row shows a balance.
-
-Output format:
 Bank: [bank name]
 Account: [account number]
 Account_Owner: [name if visible]
@@ -179,23 +158,13 @@ Date | Description | Debit | Credit | Balance
 [ONE ROW PER TRANSACTION]
 ---END---
 
-PAGE CHECK (END OF EACH PAGE):
-Re-read the header row and the last 5 transaction rows.
-Confirm each amount sits under the correct header by column position.
-If any row seems misaligned, list it under:
-RECHECK_ROWS: [Row numbers or raw row text]
-Do NOT move amounts to "fix" alignment.
-
-RULES (STRICT):
-
-One row per transaction = must have Debit or Credit.
-Do NOT infer Debit vs Credit from description.
-Do NOT shift amounts between columns.
-Copy amounts exactly as printed.
-If a row has no amount, it is only a description continuation.
-Skip summary lines (Opening/Closing Balance, Balance Forward, Monthly Average).
-Balance only if that row explicitly shows it.
-If only one amount column exists: negatives/parentheses = Debit, positives = Credit.
+RULES:
+- Do NOT infer Debit vs Credit from description.
+- Do NOT shift amounts between columns.
+- Copy amounts exactly as printed.
+- Skip summary lines (Opening/Closing Balance, Balance Forward, Monthly Average).
+- Balance only if that row explicitly shows it.
+- Single amount column: negatives/parentheses = Debit, positives = Credit.
 """
 
 sampling_params = SamplingParams(
