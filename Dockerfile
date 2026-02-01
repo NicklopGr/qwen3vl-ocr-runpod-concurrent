@@ -27,19 +27,21 @@ ENV VLLM_DISABLE_MODEL_SOURCE_CHECK=1
 ENV VLLM_CACHE_ROOT=/runpod-volume/vllm_cache
 
 # Extended timeout for first-time model download to network storage
-# First cold start may take 3-5 minutes to download 8B model
+# First cold start may take 5-10 minutes to download 30B model
 # Subsequent cold starts will be fast (model already on network storage)
 ENV RUNPOD_INIT_TIMEOUT=900
 
-# Maximum concurrent jobs per worker (default 5 for 8B model on 48GB GPU)
-ENV MAX_CONCURRENCY=5
+# Maximum concurrent jobs per worker
+# 48GB GPU (L40S): 3 for 30B-AWQ, 5 for 8B-FP8
+# 80GB GPU (A100): 4-5 for 30B-AWQ
+ENV MAX_CONCURRENCY=3
 
 # Default model - can be overridden in RunPod endpoint settings
 # Options:
 #   Qwen/Qwen3-VL-8B-Instruct-FP8            (~8GB, FP8 quantized)
-#   QuantTrio/Qwen3-VL-32B-Instruct-AWQ       (~17GB, 8-bit AWQ, 32B dense)
-#   QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ  (~17GB, 8-bit AWQ, MoE 30B/3B active)
-ENV MODEL_NAME="Qwen/Qwen3-VL-8B-Instruct-FP8"
+#   QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ  (~17GB, AWQ 4-bit, MoE 30B/3B active)
+#   Qwen/Qwen3-VL-30B-A3B-Instruct-FP8      (~30GB, FP8, needs 80GB GPU)
+ENV MODEL_NAME="QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ"
 
 # NOTE: Model is NOT pre-downloaded in this image
 # Model will be downloaded to /runpod-volume/models/ on first run

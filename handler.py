@@ -10,7 +10,7 @@ Key design:
 - A background task batches queued requests into ONE llm.generate() call
 - vLLM's LLM.generate() is NOT thread-safe; we never call it from multiple threads
 
-Model: Qwen/Qwen3-VL-8B-Instruct-FP8 (8B dense, FP8 quantized, ~8GB VRAM)
+Model: QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ (30B MoE, 3B active, AWQ 4-bit, ~17GB VRAM)
 Framework: vLLM with tensor_parallel_size=1, max_model_len=16384
 """
 
@@ -29,9 +29,9 @@ from PIL import Image
 # CONFIGURATION
 # ============================================
 NETWORK_VOLUME = "/runpod-volume"
-MODEL_NAME = os.environ.get("MODEL_NAME", "Qwen/Qwen3-VL-8B-Instruct-FP8")
+MODEL_NAME = os.environ.get("MODEL_NAME", "QuantTrio/Qwen3-VL-30B-A3B-Instruct-AWQ")
 TENSOR_PARALLEL_SIZE = int(os.environ.get("TENSOR_PARALLEL_SIZE", "1"))
-MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "5"))
+MAX_CONCURRENCY = int(os.environ.get("MAX_CONCURRENCY", "3"))
 
 # How long (seconds) the batch processor waits to collect more requests before firing
 BATCH_WAIT_SECONDS = float(os.environ.get("BATCH_WAIT_SECONDS", "0.5"))
@@ -112,7 +112,7 @@ llm = LLM(
     model=model_path,
     trust_remote_code=True,
     max_model_len=16384,
-    max_num_seqs=MAX_CONCURRENCY * 2,    # Allow 2x concurrency for sequence scheduling headroom
+    max_num_seqs=min(MAX_CONCURRENCY * 2, 6),  # Cap at 6 for 30B model VRAM constraints
     gpu_memory_utilization=0.95,
     dtype="auto",
     tensor_parallel_size=TENSOR_PARALLEL_SIZE,
